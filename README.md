@@ -23,4 +23,4 @@ python3 Storyforge.py
 
 `setup.sh` selects and saves a performance mode. You can change it later with `p` from the main menu or `x`, then `p`, in Settings.
 
-Models selected by a profile that are not installed can be pulled from Settings > Models per role > `p`. Benchmark with `python3 Storyforge.py --benchmark`.
+Models selected by a profile that are not installed can be pulled from Settings > Models per role > `p`, then choose Ollama or Hugging Face. The Hugging Face option downloads a mapped Q4_K_M GGUF and imports it into the same Ollama model tag; downloads are cached under StoryForge's data directory and streamed to the configured Ollama host. If Ollama is unreachable, downloads are cached and can be imported by repeating the pull later. Set `HF_TOKEN` or `HUGGING_FACE_HUB_TOKEN` in the environment if a selected repository requires authentication. This bypasses Ollama's model-library download, not Ollama inference itself; the configured Ollama server must still be reachable for import and play. Benchmark with `python3 Storyforge.py --benchmark`.

@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import copy
 import datetime
+import hashlib
 import json
 import math
 import os
@@ -35,6 +36,7 @@ import sys
 import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -52,6 +54,7 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 SAVE_DIR = DATA_DIR / "saves"
 EXPORT_DIR = DATA_DIR / "exports"
 BENCH_FILE = DATA_DIR / "benchmark.json"
+HF_MODEL_DIR = DATA_DIR / "huggingface" / "models"
 
 # --------------------------------------------------------------------------- settings
 # role -> (default model, label, short description)
@@ -76,6 +79,24 @@ PERFORMANCE_MODES = {
              "models": {"narrator": "qwen2.5:3b", "choices": "qwen2.5-coder:3b",
                         "analyst": "gemma3:4b", "router": "qwen2.5:3b",
                         "tools": "functiongemma:270m", "memory": "nomic-embed-text"}},
+}
+HF_GGUF_SOURCES = {
+    "qwen2.5:0.5b": ("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "qwen2.5-0.5b-instruct-q4_k_m.gguf"),
+    "qwen2.5:1.5b": ("Qwen/Qwen2.5-1.5B-Instruct-GGUF", "qwen2.5-1.5b-instruct-q4_k_m.gguf"),
+    "qwen2.5:3b": ("Qwen/Qwen2.5-3B-Instruct-GGUF", "qwen2.5-3b-instruct-q4_k_m.gguf"),
+    "qwen2.5-coder:0.5b": ("Qwen/Qwen2.5-Coder-0.5B-Instruct-GGUF",
+                            "qwen2.5-coder-0.5b-instruct-q4_k_m.gguf"),
+    "qwen2.5-coder:1.5b": ("Qwen/Qwen2.5-Coder-1.5B-Instruct-GGUF",
+                            "qwen2.5-coder-1.5b-instruct-q4_k_m.gguf"),
+    "qwen2.5-coder:3b": ("Qwen/Qwen2.5-Coder-3B-Instruct-GGUF",
+                         "qwen2.5-coder-3b-instruct-q4_k_m.gguf"),
+    "gemma3:270m": ("lmstudio-community/gemma-3-270m-it-GGUF", "gemma-3-270m-it-Q4_K_M.gguf"),
+    "gemma3:1b": ("lmstudio-community/gemma-3-1b-it-GGUF", "gemma-3-1b-it-Q4_K_M.gguf"),
+    "gemma3:4b": ("lmstudio-community/gemma-3-4b-it-GGUF", "gemma-3-4b-it-Q4_K_M.gguf"),
+    "smollm2:135m": ("lmstudio-community/SmolLM2-135M-Instruct-GGUF",
+                     "SmolLM2-135M-Instruct-Q4_K_M.gguf"),
+    "functiongemma:270m": ("unsloth/functiongemma-270m-it-GGUF", "functiongemma-270m-it-Q4_K_M.gguf"),
+    "nomic-embed-text": ("nomic-ai/nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.Q4_K_M.gguf"),
 }
 LENGTHS = {"short": 60, "medium": 100, "long": 160}
 KEEP_ALIVES = ["1m", "5m", "30m"]
@@ -675,6 +696,68 @@ class Ollama:
                     if "error" in o:
                         raise OllamaError(str(o["error"]), 500)
                     on_progress(o)
+
+    def has_blob(self, digest):
+        request = urllib.request.Request(self.base + "/api/blobs/" + digest, method="HEAD")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout):
+                return True
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return False
+            raise OllamaError("Ollama blob check failed (HTTP %d)" % error.code, error.code) from None
+        except (urllib.error.URLError, OSError) as error:
+            raise OllamaError("cannot reach Ollama at %s (%s)" % (
+                self.base, getattr(error, "reason", error))) from None
+
+    def push_blob(self, path, on_progress):
+        size = os.path.getsize(path)
+        digest = hashlib.sha256()
+        with open(path, "rb") as source:
+            completed = 0
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                completed += len(chunk)
+                on_progress({"status": "Checking GGUF digest", "completed": completed, "total": size})
+        digest = "sha256:" + digest.hexdigest()
+        if self.has_blob(digest):
+            on_progress({"status": "GGUF blob already exists in Ollama", "completed": size, "total": size})
+            return digest
+
+        def upload_chunks():
+            completed = 0
+            with open(path, "rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    completed += len(chunk)
+                    on_progress({"status": "Uploading GGUF to Ollama", "completed": completed, "total": size})
+                    yield chunk
+
+        request = urllib.request.Request(self.base + "/api/blobs/" + digest, data=upload_chunks(), method="POST",
+                                         headers={"Content-Type": "application/octet-stream",
+                                                  "Content-Length": str(size)})
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                response.read()
+        except urllib.error.HTTPError as error:
+            raise OllamaError("Ollama blob upload failed (HTTP %d)" % error.code, error.code) from None
+        except (urllib.error.URLError, OSError) as error:
+            raise OllamaError("Ollama blob upload failed (%s)" % getattr(error, "reason", error)) from None
+        return digest
+
+    def create(self, model, files, on_progress):
+        with self._req("/api/create", {"model": model, "files": files, "stream": True}) as r:
+            for line in r:
+                if line.strip():
+                    obj = json.loads(line)
+                    if "error" in obj:
+                        raise OllamaError(str(obj["error"]), 500)
+                    on_progress(obj)
 
 
 class Scheduler:
@@ -2085,9 +2168,97 @@ class App:
                 say(dim("  Start it with: sudo systemctl start ollama   (or change the host in x > h)"))
             return False
 
-    def pull_models(self, models):
-        for m in models:
-            say("  Pulling %s ..." % m)
+    def download_hf_model(self, model, on_progress):
+        source = HF_GGUF_SOURCES.get(model)
+        if not source:
+            raise OllamaError("no Hugging Face GGUF mapping for %s; choose an Ollama model name" % model)
+        repo, filename = source
+        HF_MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        slug = re.sub(r"[^A-Za-z0-9._-]+", "-", model)
+        destination = HF_MODEL_DIR / (slug + ".gguf")
+        if destination.is_file():
+            with open(destination, "rb") as cached:
+                valid_cache = cached.read(4) == b"GGUF"
+            if valid_cache:
+                on_progress({"status": "Using cached Hugging Face file", "completed": 1, "total": 1})
+                return destination
+            destination.unlink()
+
+        url = "https://huggingface.co/%s/resolve/main/%s?download=true" % (
+            urllib.parse.quote(repo, safe="/"), urllib.parse.quote(filename, safe=""))
+        headers = {"User-Agent": "StoryForge/%s" % VERSION}
+        token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        request = urllib.request.Request(url, headers=headers)
+        partial = destination.with_suffix(destination.suffix + ".part")
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                total = int(response.headers.get("Content-Length") or 0)
+                if total and shutil.disk_usage(str(HF_MODEL_DIR)).free < total:
+                    raise OllamaError("not enough free disk space for %s" % filename)
+                completed = 0
+                with open(partial, "wb") as output:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        output.write(chunk)
+                        completed += len(chunk)
+                        on_progress({"status": "Downloading %s" % filename,
+                                     "completed": completed, "total": total})
+            if total and completed != total:
+                raise OllamaError("incomplete Hugging Face download (%d of %d bytes)" % (completed, total))
+            os.replace(partial, destination)
+            with open(destination, "rb") as downloaded:
+                if downloaded.read(4) != b"GGUF":
+                    destination.unlink()
+                    raise OllamaError("Hugging Face response was not a GGUF file")
+        except OllamaError:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            raise
+        except urllib.error.HTTPError as error:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            if error.code == 401:
+                message = "Hugging Face denied access; this file may require HF_TOKEN"
+            else:
+                message = "Hugging Face download failed (HTTP %d)" % error.code
+            raise OllamaError(message, error.code) from None
+        except (urllib.error.URLError, OSError) as error:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            raise OllamaError("Hugging Face download failed (%s)" % getattr(error, "reason", error)) from None
+        return destination
+
+    def pull_models(self, models, source=None):
+        if source is None:
+            say("  Model source: o) Ollama library  h) Hugging Face GGUF")
+            selected = ask("  Pull source [o/h]> ").lower()
+            if selected in ("o", "ollama"):
+                source = "ollama"
+            elif selected in ("h", "huggingface", "hf"):
+                source = "huggingface"
+            else:
+                say(dim("  Pull cancelled; choose o or h."))
+                return
+        ollama_online = True
+        if source == "huggingface":
+            try:
+                self.ai.client.version()
+            except OllamaError:
+                ollama_online = False
+                say(dim("  Ollama is unreachable. Hugging Face files will be cached now; retry this pull "
+                        "to import them after Ollama is online."))
+        for m in dict.fromkeys(models):
+            say("  Pulling %s from %s ..." % (m, "Hugging Face" if source == "huggingface" else "Ollama"))
             last = {"s": ""}
 
             def prog(o):
@@ -2104,11 +2275,19 @@ class App:
                 last["s"] = st
 
             try:
-                self.ai.client.pull(m, prog)
+                if source == "huggingface":
+                    model_file = self.download_hf_model(m, prog)
+                    if ollama_online:
+                        digest = self.ai.client.push_blob(model_file, prog)
+                        self.ai.client.create(m, {model_file.name: digest}, prog)
+                    else:
+                        say(dim("  Cached %s; retry when Ollama is reachable." % model_file.name))
+                else:
+                    self.ai.client.pull(m, prog)
                 if sys.stdout.isatty():
                     say()
-            except OllamaError as e:
-                say(red("\n  Could not pull %s: %s" % (m, e)))
+            except (OllamaError, OSError) as e:
+                say(red("\n  Could not pull/import %s: %s" % (m, e)))
         self.connect(quiet=True)
 
     def ensure_ready(self):
@@ -2249,7 +2428,7 @@ class App:
                 m = c["models"][role]
                 flag = green("ok     ") if norm(m) in self.ai.installed else red("missing")
                 say(" %d) %-9s %-20s %s %s" % (i, label, m, flag, dim(desc)))
-            say(dim(" 1-6 change a model | p pull missing | d defaults | x back"))
+            say(dim(" 1-6 change a model | p pull missing (Ollama/Hugging Face) | d defaults | x back"))
             k = getkey()
             if k.isdigit() and 1 <= int(k) <= len(ROLES):
                 role = list(ROLES)[int(k) - 1]
