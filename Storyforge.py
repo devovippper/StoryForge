@@ -133,6 +133,19 @@ LOCAL_MAP_SCHEMA = {
     },
     "required": ["nearby_places", "inside_places"],
 }
+LOCAL_CHARACTERS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "characters": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "description": {"type": "string"},
+            "appearance": {"type": "string"}, "clothing": {"type": "string"},
+            "occupation": {"type": "string"},
+            "traits": {"type": "array", "items": {"type": "string"}},
+            "family": {"type": "array", "items": {"type": "string"}}},
+            "required": ["name", "description", "appearance", "clothing", "occupation", "traits", "family"]}},
+    },
+    "required": ["characters"],
+}
 MAP_ICONS = {"city": "C", "village": "v", "fort": "F", "workplace": "W", "landmark": "*"}
 KEEP_ALIVES = ["1m", "5m", "30m"]
 
@@ -310,8 +323,12 @@ ANALYSIS_SCHEMA = {
         "loyalty_changes": {"type": "array", "items": {"type": "object", "properties": {
             "character": {"type": "string"}, "delta": {"type": "integer"},
             "basis": {"type": "string"}}, "required": ["character", "delta", "basis"]}},
-    },
-    "required": ["mood", "danger", "characters", "location", "party_changes", "loyalty_changes"],
+            "character_movements": {"type": "array", "items": {"type": "object", "properties": {
+                "character": {"type": "string"}, "location": {"type": "string"}},
+                "required": ["character", "location"]}},
+        },
+        "required": ["mood", "danger", "characters", "location", "party_changes", "loyalty_changes",
+                     "character_movements"],
 }
 ENHANCED_ANALYSIS_SCHEMA = {
     "type": "object",
@@ -327,6 +344,9 @@ ENHANCED_ANALYSIS_SCHEMA = {
         "loyalty_changes": {"type": "array", "items": {"type": "object", "properties": {
             "character": {"type": "string"}, "delta": {"type": "integer"},
             "basis": {"type": "string"}}, "required": ["character", "delta", "basis"]}},
+        "character_movements": {"type": "array", "items": {"type": "object", "properties": {
+            "character": {"type": "string"}, "location": {"type": "string"}},
+            "required": ["character", "location"]}},
         "character_notes": {"type": "array", "items": {"type": "object", "properties": {
             "name": {"type": "string"}, "memory": {"type": "string"},
             "wants_remember": {"type": "boolean"}, "importance": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -369,7 +389,8 @@ ENHANCED_ANALYSIS_SCHEMA = {
     },
     "required": ["mood", "danger", "characters", "location", "event", "character_notes", "relationships",
                  "party_changes", "loyalty_changes", "character_updates", "world_changes",
-                 "time_advance_minutes", "scene_objective", "scene_stakes", "player_knowledge"],
+                 "time_advance_minutes", "scene_objective", "scene_stakes", "player_knowledge",
+                 "character_movements"],
 }
 
 
@@ -406,6 +427,7 @@ ROUTE_PROMPT = ("You sort messages typed by a player of a text adventure. Answer
                 "trade (the player proposes an exchange), look (the player wants to see their surroundings) "
                 "or inventory (the player asks what they carry).\nMessage: ")
 FALLBACK_CHOICES = ["Look around carefully", "Press onward", "Wait and listen", "Turn back"]
+MAX_KNOWN_CHARACTERS = 64
 
 
 # --------------------------------------------------------------------------- terminal helpers
@@ -1283,6 +1305,8 @@ def new_state(p, mode="low"):
                                "player_backstory": "", "player_info": "",
                                "loading_tips": list(DEFAULT_LOADING_TIPS)},
             "world_map": [{"name": p["location"], "kind": "village"}], "local_maps": {},
+            "location_parents": {}, "character_locations": {},
+            "character_rosters_generated": [],
             "character_details": {},
             "turns": [], "memories": [], "emb_model": None, "choices": [], "over": False,
             "performance_mode": mode, "places": [p["location"]], "events": [],
@@ -1305,6 +1329,11 @@ class Game:
         self.s.setdefault("player_character", {"gender": "", "age": None, "description": "", "traits": []})
         self.s.setdefault("world_map", [{"name": self.s.get("location", "Starting place"), "kind": "village"}])
         self.s.setdefault("local_maps", {})
+        self.s.setdefault("location_parents", {})
+        self.s.setdefault("character_locations", {})
+        self.s.setdefault("character_rosters_generated", [])
+        for name in self.s.get("characters", []):
+            self.s["character_locations"].setdefault(name, self.s["location"])
         for key, default in (("world_look", ""), ("cities", []), ("famous_people", []),
                              ("player_backstory", ""), ("player_info", ""),
                              ("loading_tips", list(DEFAULT_LOADING_TIPS))):
@@ -1418,6 +1447,68 @@ class Game:
         maps[location] = fallback
         return fallback
 
+    def register_character(self, person, location):
+        name = sstr(person.get("name"), 30)
+        if not name:
+            return ""
+        existing = next((known for known in self.s["characters"]
+                         if known.casefold() == name.casefold()), None)
+        if existing is None:
+            if len(self.s["characters"]) >= MAX_KNOWN_CHARACTERS:
+                return ""
+            existing = name
+            self.s["characters"].append(existing)
+            self.s.setdefault("relationships", {})[existing] = {
+                "trust": 0, "affinity": 0, "respect": 0, "loyalty": 0, "notes": []}
+            traits = person.get("traits", [])
+            family = person.get("family", [])
+            self.s.setdefault("character_profiles", {})[existing] = sstr(person.get("description"), 200)
+            self.s.setdefault("character_details", {})[existing] = {
+                "appearance": sstr(person.get("appearance"), 180),
+                "clothing": sstr(person.get("clothing"), 180),
+                "occupation": sstr(person.get("occupation"), 100),
+                "traits": [sstr(trait, 80) for trait in traits if sstr(trait, 80)][:5]
+                          if isinstance(traits, list) else [],
+            }
+            self.s.setdefault("character_family", {})[existing] = [
+                sstr(member, 80) for member in family if sstr(member, 80)][:5] \
+                if isinstance(family, list) else []
+            self.s.setdefault("character_locations", {})[existing] = location
+        return existing
+
+    def ensure_location_characters(self, location):
+        generated = self.s.setdefault("character_rosters_generated", [])
+        if location.casefold() in [name.casefold() for name in generated]:
+            return
+        known = ", ".join(self.s.get("characters", [])) or "none"
+        prompt = (
+            "Create a small cast of distinct original people currently present at this place in an "
+            "interactive story. Return 4-6 named people who fit the location, time, genre, and world; "
+            "include residents, workers, travelers, or visitors as appropriate. Use distinct plausible "
+            "names, roles, personalities, appearances, and clothing. Do not reuse any known character "
+            "names. For an explicitly abandoned or remote place, create only people who plausibly belong "
+            "there, such as a caretaker or traveler, and return an empty list if nobody should be present. "
+            "Do not create a quest or urgent problem. Return only the requested JSON.\n\n"
+            "World: %s\nPlace the player just entered: %s\nKnown names to avoid: %s" % (
+                self.s.get("setting", ""), location, known))
+        try:
+            response = self.ai.chat(
+                "narrator", [{"role": "user", "content": prompt}], "local characters",
+                fmt=LOCAL_CHARACTERS_SCHEMA,
+                options={"temperature": 0.7, "num_predict": 500})
+            content = response.get("content") if isinstance(response, dict) else None
+            details = json.loads(content) if isinstance(content, str) else None
+            if not isinstance(details, dict) or not isinstance(details.get("characters"), list):
+                raise ValueError("local character response was not a character list")
+        except (OllamaError, Unavailable, ValueError, AttributeError, TypeError) as error:
+            say(dim("  Local people could not be generated (%s); they may appear on a later visit." %
+                    str(error)[:90]))
+            return
+        for person in details["characters"][:8]:
+            if isinstance(person, dict):
+                self.register_character(person, location)
+        generated.append(location)
+
     def guard(self, fn, *args, role=None):
         """Run an optional pipeline stage; a failure skips the stage instead of the turn."""
         try:
@@ -1451,12 +1542,19 @@ class Game:
         ranked = sorted(old, key=lambda m: -cosine(vecs[0], m["vec"]))
         return [m["text"] for m in ranked[:self.cfg["recall"]]]
 
-    def narrate(self, action, recalled):
+    def narrate(self, action, recalled, destination=None):
         s, cfg = self.s, self.cfg
         words = LENGTHS[cfg["length"]]
         player = s.get("player_character", {})
         narration_style = NARRATION_MODES.get(cfg.get("narration_mode", 2), NARRATION_MODES[2])[1]
         recent_turns = s.get("turns", [])[-5:]
+        party_members = {name.casefold() for name in s.get("party", [])}
+        scene_location = (destination or s.get("location", "")).casefold()
+        present_characters = [
+            name for name in s.get("characters", [])
+            if s.get("character_locations", {}).get(name, s.get("location", "")).casefold()
+            == scene_location or name.casefold() in party_members
+        ]
         system = ("You are the narrator of an interactive story. Genre: %s. Tone: %s.\nWorld: %s\n"
                   "The player is %s. Narration mode: %s\n"
                   "Character identity and traits: %s. Treat gender as pronoun guidance, not a personality "
@@ -1474,7 +1572,14 @@ class Game:
                   "the player's action and end at a moment that calls for a decision. Actions with people can "
                   "create lasting turns in "
                   "the story—alliances, betrayals, revelations, or new journeys—but make major pivots rare "
-                  "and grounded in meaningful choices. Most conversations should stay ordinary and human. "
+                  "and grounded in meaningful choices. Places should feel inhabited: show a few fitting "
+                  "locals when the player visits a populated place and introduce named people naturally as "
+                  "the player explores. Give recurring people distinct names and behavior; avoid empty places "
+                  "and avoid repeating the same generic crowd everywhere. In conversation, people may offer "
+                  "directions or invite the player along. If the player's action or stated reply clearly "
+                  "accepts being led or going there, continue through the move and establish the destination "
+                  "as the current location. A place merely mentioned in dialogue is not a move. Most "
+                  "conversations should stay ordinary and human. "
                   "Maintain strict continuity. Treat the established story, people, locations, current goals, "
                   "and consequences as canonical. Do not introduce a new person, place, urgent problem, quest, "
                   "or mystery merely to make something happen; add new elements only when the player's action "
@@ -1496,14 +1601,20 @@ class Game:
         if player.get("description") or player.get("traits"):
             parts.append("Player-created character details (respect these in narration and reactions): "
                          + json.dumps(player, ensure_ascii=True))
-        if s.get("character_profiles"):
+        profiles = {name: s["character_profiles"][name] for name in present_characters
+                    if s.get("character_profiles", {}).get(name)}
+        if profiles:
             parts.append("Important people and their backgrounds: " + json.dumps(
-                s["character_profiles"], ensure_ascii=True))
-        if s.get("character_details"):
+                profiles, ensure_ascii=True))
+        details = {name: s["character_details"][name] for name in present_characters
+                   if s.get("character_details", {}).get(name)}
+        if details:
             parts.append("Known physical descriptions, clothing, occupations, and traits of important people: "
-                         + json.dumps(s["character_details"], ensure_ascii=True))
-        if s.get("character_family"):
-            parts.append("Known character family ties: " + json.dumps(s["character_family"], ensure_ascii=True))
+                         + json.dumps(details, ensure_ascii=True))
+        family = {name: s["character_family"][name] for name in present_characters
+                  if s.get("character_family", {}).get(name)}
+        if family:
+            parts.append("Known character family ties: " + json.dumps(family, ensure_ascii=True))
         if s.get("party"):
             parts.append("Traveling party: " + ", ".join(s["party"]))
         if s["summary"]:
@@ -1517,11 +1628,15 @@ class Game:
                     brief(turn.get("action", ""), 180), brief(turn.get("scene", ""), 450))
                 for index, turn in enumerate(recent_turns))
             parts.append("Recent story events, in order (canonical; continue from the last one):\n" + history)
-        parts.append("Current state - " + self.state_line())
-        if s["characters"]:
-            parts.append("Known characters: " + ", ".join(s["characters"]))
+        parts.append("Current state - " + self.state_line(destination))
+        if destination and destination.casefold() != s["location"].casefold():
+            parts.append("The player is traveling to %s. Narrate the journey and end with the player "
+                         "arriving there; that is the destination and location at the end of this turn."
+                         % destination)
+        if present_characters:
+            parts.append("People present here or traveling with the player: " + ", ".join(present_characters))
         social_context = []
-        for name in s["characters"]:
+        for name in present_characters:
             details = name + ": " + self.relationship_impression(name)
             if s.get("character_profiles", {}).get(name):
                 details += "; " + s["character_profiles"][name]
@@ -1539,7 +1654,7 @@ class Game:
                 parts.append("Persistent events:\n" + "\n".join(
                     "- " + brief(e.get("event", ""), 180) for e in s["events"][-5:]))
             profiles = []
-            for name in s.get("characters", []):
+            for name in present_characters:
                 notes = self.character_memories(name)
                 relation = s.get("relationships", {}).get(name, {})
                 line = name
@@ -1574,8 +1689,8 @@ class Game:
                          "fits the current scene, without forcing every thread into every scene.")
         if action is None:
             parts.append("Open on a walkable, lived-in place at %s. Establish the world through concrete "
-                         "sensory details and a few people going about their lives; bring at least one named "
-                         "important local into view naturally. Give the player room to "
+                         "sensory details and several people going about their lives; bring at least two named "
+                         "important locals into view naturally. Give the player room to "
                          "look around and choose whom to approach. Do not start with an assigned delivery, "
                          "urgent mission, or mandatory quest; let longer adventures emerge naturally from "
                          "exploration and conversations." % s["location"])
@@ -1637,14 +1752,22 @@ class Game:
 
     def analyze(self, scene):
         prompt = ("Read this story passage and fill in: mood; danger (0 safe, 1 uneasy, 2 risky, 3 deadly); "
-                  "characters (people or creatures present, at most 4, short names); location (at most 5 "
-                  "words). For party_changes, report joined only when the scene explicitly confirms they "
+                  "characters (people or creatures present, at most 6, short names); location (the player's "
+                  "current physical location at the end of the passage, at most 5 words). The location at "
+                  "the start of this passage is %s. Change it only if the passage shows the player actually "
+                  "arriving somewhere else, including after accepting an invitation or following directions "
+                  "during a conversation; a place merely mentioned is not a move. Include character_movements "
+                  "only when the passage explicitly shows a named character changing location or traveling "
+                  "with the player; give their destination. People who are not present do not belong in "
+                  "characters. "
+                  "For party_changes, report joined only when the scene explicitly confirms they "
                   "accepted an invitation; otherwise return an empty list. "
                   "Do not infer acceptance from politeness or an unresolved offer. For loyalty_changes, use "
                   "small deltas (-10..10) only for meaningful actions involving a character's safety, family, "
                   "or a major shared commitment. Ordinary conversations and routine actions have no loyalty "
                   "change. Give a brief, passage-grounded basis; consider past trust, family ties, and shared "
-                  "history. Otherwise return an empty list.\n\nPassage:\n" + scene)
+                  "history. Otherwise return an empty list.\n\nPassage:\n" % self.s.get("location", "unknown")
+                  + scene)
         enhanced = self.enhanced()
         schema = ANALYSIS_SCHEMA
         if enhanced:
@@ -1703,13 +1826,21 @@ class Game:
         except (TypeError, ValueError):
             danger = 0
         characters = d.get("characters", [])
-        chars = [sstr(c, 30) for c in characters if sstr(c, 30)][:4] \
+        chars = [sstr(c, 30) for c in characters if sstr(c, 30)][:6] \
             if isinstance(characters, list) else []
         loc = sstr(d.get("location", ""), 40)
         if not (0 < len(loc.split()) <= 5):
             loc = self.s["location"]
         result = {"mood": mood, "danger": danger, "characters": chars,
                   "location": loc}
+        movements = d.get("character_movements", [])
+        result["character_movements"] = [
+            {"character": sstr(movement.get("character"), 30),
+             "location": sstr(movement.get("location"), 40)}
+            for movement in movements if isinstance(movement, dict)
+            and sstr(movement.get("character"), 30)
+            and 0 < len(sstr(movement.get("location"), 40).split()) <= 5
+        ][:6] if isinstance(movements, list) else []
         party_changes = d.get("party_changes", [])
         result["party_changes"] = [
             {"character": sstr(change.get("character"), 30),
@@ -2059,7 +2190,8 @@ class Game:
         s.setdefault("character_family", {})
         for update in updates:
             name = self.character_key(update["name"])
-            if name.lower() not in [c.lower() for c in s["characters"]] and len(s["characters"]) < 8:
+            if name.lower() not in [c.lower() for c in s["characters"]] \
+                    and len(s["characters"]) < MAX_KNOWN_CHARACTERS:
                 s["characters"].append(name)
             if update["goal"]:
                 s["character_goals"][name] = update["goal"]
@@ -2089,6 +2221,24 @@ class Game:
                                             "event": "stage advanced"})
                     arc["stage"] = update["arc_stage"]
                 del arc["history"][:-12]
+
+    def apply_character_presence(self, info, location):
+        for name in info.get("characters", []):
+                canonical = self.character_key(name)
+                if canonical not in self.s["characters"] and len(self.s["characters"]) < MAX_KNOWN_CHARACTERS:
+                    self.s["characters"].append(canonical)
+                    self.s.setdefault("relationships", {}).setdefault(canonical, {
+                        "trust": 0, "affinity": 0, "respect": 0, "loyalty": 0, "notes": []})
+                if canonical in self.s["characters"]:
+                    self.s.setdefault("character_locations", {})[canonical] = location
+        for movement in info.get("character_movements", []):
+                name = self.character_key(movement["character"])
+                if name in self.s["characters"]:
+                    self.s.setdefault("character_locations", {})[name] = movement["location"]
+        for name in self.s.get("party", []):
+                canonical = self.character_key(name)
+                if canonical in self.s["characters"]:
+                    self.s.setdefault("character_locations", {})[canonical] = location
 
     def apply_analysis(self, info, action=""):
         s = self.s
@@ -2216,7 +2366,7 @@ class Game:
         return tidy(res["content"])
 
     # ---- one full turn
-    def take_turn(self, action):
+    def take_turn(self, action, destination=None):
         s, ai, cfg = self.s, self.ai, self.cfg
         starting_location = s.get("location", "")
         ai.timing = {}
@@ -2225,7 +2375,7 @@ class Game:
         if action is not None and cfg["recall"] and ai.has("memory") and len(s["memories"]) > 2:
             recalled = self.guard(self.recall, action, role="memory") or []
         say()
-        scene = self.narrate(action, recalled)
+        scene = self.narrate(action, recalled, destination)
         info = self.guard(self.analyze, scene, role="analyst") or {}
         turn = {"action": action or "(the story begins)", "scene": scene,
                 "mood": info.get("mood", "calm"), "danger": info.get("danger", 0)}
@@ -2233,9 +2383,11 @@ class Game:
         calls = []
         if cfg["tracking"] and ai.has("tools"):
             calls = self.guard(self.track, action, scene, role="tools") or []
-        next_location = starting_location
-        if info and info.get("location") and info["location"].casefold() != starting_location.casefold():
+        next_location = destination or starting_location
+        if not destination and info and info.get("location") \
+                and info["location"].casefold() != starting_location.casefold():
             next_location = info["location"]
+        tracked_location = ""
         for call in calls:
             fn = call.get("function", {}) if isinstance(call, dict) else {}
             if fn.get("name") != "change_location":
@@ -2249,11 +2401,19 @@ class Game:
             if isinstance(args, dict):
                 place = sstr(args.get("place"), 40)
                 if place and place.casefold() != starting_location.casefold():
-                    next_location = place
+                    tracked_location = place
                     break
+        if tracked_location and not destination:
+            next_location = tracked_location
         choices = self.guard(self.make_choices, scene, next_location, role="choices") or []
         # ---- commit (nothing above touched the saved state, so Ctrl-C leaves it intact)
         notes = self.apply_calls(calls)
+        if destination and destination.casefold() != starting_location.casefold():
+            s["location"] = destination
+            if destination not in s.setdefault("places", []):
+                s["places"].append(destination)
+        if s["location"].casefold() != starting_location.casefold():
+            s.setdefault("location_parents", {}).setdefault(s["location"], starting_location)
         if self.enhanced():
             event = {
                 "id": uuid.uuid4().hex[:12],
@@ -2268,10 +2428,10 @@ class Game:
             for c in info["characters"]:
                 if c.lower() not in [x.lower() for x in s["characters"]]:
                     s["characters"].append(c)
-            s["characters"] = s["characters"][-8:]
+            s["characters"] = s["characters"][-MAX_KNOWN_CHARACTERS:]
             if self.enhanced():
                 self.apply_analysis(info, action)
-                s["characters"] = s["characters"][-8:]
+                s["characters"] = s["characters"][-MAX_KNOWN_CHARACTERS:]
             else:
                 self.apply_loyalty_changes(info)
                 self.apply_party_changes(info, action)
@@ -2279,8 +2439,10 @@ class Game:
                 s["location"] = info["location"]
                 if info["location"] not in s.setdefault("places", []):
                     s["places"].append(info["location"])
+        self.apply_character_presence(info or {}, s["location"])
         if s.get("location", "").casefold() != starting_location.casefold():
             self.ensure_local_map(s["location"])
+            self.ensure_location_characters(s["location"])
         if folded:
             s["summary"], s["summarized_upto"] = folded
         s["turns"].append(turn)
@@ -2626,23 +2788,35 @@ class Game:
             elif key in ("x", "q", "esc", "\n"):
                 return None
 
+    def characters_here(self):
+        s = self.s
+        party = [member.casefold() for member in s.get("party", [])]
+        current = s.get("location", "").casefold()
+        return [
+            name for name in s["characters"]
+            if s.get("character_locations", {}).get(name, s.get("location", "")).casefold()
+            == current or name.casefold() in party
+        ]
+
     def people_menu(self, select_to_talk=False):
         s = self.s
         while True:
             clear_screen()
             say()
             say(rule("People"))
-            if not s["characters"]:
-                say("  You have not met anyone yet. Explore the scene to meet people.")
-            for i, name in enumerate(s["characters"], 1):
+            party = [member.casefold() for member in s.get("party", [])]
+            available = self.characters_here()
+            if not available:
+                say("  No one you know is here yet. Explore to meet the locals.")
+            for i, name in enumerate(available, 1):
+                in_party = name.casefold() in party
                 say("  %d) %s%s" % (
-                    i, name, " - traveling with you" if name.lower() in
-                    [member.lower() for member in s.get("party", [])] else ""))
+                    i, name, " - traveling with you" if in_party else ""))
             say(dim("  Choose someone to speak with; x back" if select_to_talk else
                     "  Choose a person to talk, trade, or invite to your party; x back"))
             key = getkey()
-            if key.isdigit() and 1 <= int(key) <= len(s["characters"]):
-                name = s["characters"][int(key) - 1]
+            if key.isdigit() and 1 <= int(key) <= len(available):
+                name = available[int(key) - 1]
                 if select_to_talk:
                     return self.interact_with_person(name, talk_only=True)
                 action = self.interact_with_person(name)
@@ -2704,39 +2878,62 @@ class Game:
         say("  South")
         say(dim("  Roads are laid out by the game; symbols show generated settlements and sites."))
         say(dim("  @ here  C city  v village  F fort  W workplace  * important spot"))
+        say(dim("  Select a destination number to travel; Enter returns."))
         for index, point in enumerate(points):
             name, kind = point[2], point[3]
             current = self.s["location"].casefold()
             icon = "@" if current and (name.casefold() in current or current in name.casefold()) \
                 else MAP_ICONS[kind]
             say("  %2d. [%s] %s" % (index + 1, icon, name))
-        say(dim("  Press any key to return."))
-        getkey()
+        selection = ask("  Destination number (Enter to return)> ").strip()
+        if not selection.isdigit() or not 1 <= int(selection) <= len(points):
+            return None
+        destination = points[int(selection) - 1][2]
+        if destination.casefold() == self.s["location"].casefold():
+            return None
+        return ("The player travels to %s." % destination, destination)
 
     def show_local_map(self):
         local = self.ensure_local_map()
         self.app.save_state(self.s)
         clear_screen()
         say(rule("Places near %s" % self.s["location"]))
+        destinations = []
         say("  Nearby")
         if local["nearby_places"]:
             for name in local["nearby_places"]:
-                say("    [ ] %s" % name)
+                destinations.append((name, "nearby"))
+                say("  %2d. %s" % (len(destinations), name))
         else:
             say("    No nearby places listed.")
         say()
         say("  Inside")
         for name in local["inside_places"]:
-            say("    [%s] %s" % (">" if name.casefold() == "exit" else " ", name))
-        say(dim("  Press any key to return."))
-        getkey()
+            destinations.append((name, "inside"))
+            say("  %2d. [%s] %s" % (
+                len(destinations), ">" if name.casefold() == "exit" else " ", name))
+        selection = ask("  Destination number (Enter to return)> ").strip()
+        if not selection.isdigit() or not 1 <= int(selection) <= len(destinations):
+            return None
+        name, kind = destinations[int(selection) - 1]
+        if name.casefold() == "exit":
+            parent_locations = self.s.get("location_parents", {})
+            destination = next((place for current, place in parent_locations.items()
+                                if current.casefold() == self.s["location"].casefold()), "")
+            destination = destination or "outside " + self.s["location"]
+            return ("The player exits %s and returns to %s." % (self.s["location"], destination),
+                    destination)
+        self.s.setdefault("location_parents", {}).setdefault(name, self.s["location"])
+        movement = "walks inside %s to" % self.s["location"] if kind == "inside" \
+            else "travels from %s to" % self.s["location"]
+        return ("The player %s %s." % (movement, name), name)
 
     def show_help(self):
         say()
         say("  1-%d  take that action        t  type any action" % len(self.s["choices"]))
         say("  l  look around (fast)         i  items and player info   r  story recap")
         say("  p  People (talk, trade, party) c  Talk to someone")
-        say("  m  world map                 Shift+M  local places map")
+        say("  m  world map/travel          Shift+M  local places/travel")
         say("  Up/Down  browse story history")
         say("  PgUp/PgDn  browse story history from the game menu")
         say("  u  customize places/people    x  settings               b  benchmark models")
@@ -2756,7 +2953,7 @@ class Game:
         say()
         for i, c in enumerate(s["choices"], 1):
             say("  %d) %s" % (i, c))
-        say(dim("  p:people  c:talk  t:type  m:world map  Shift+M:local map"))
+        say(dim("  p:people  c:talk  t:type  m:world map/travel  Shift+M:local travel"))
         say(dim("  l:look  i:items  r:recap  u:edit  Up/Down/PgUp/PgDn:history"))
         say(dim("  d:debug  a:branch  x:settings  b:bench  e:export  h:help  q:menu"))
 
@@ -2783,12 +2980,17 @@ class Game:
             self.menu()
             k = getkey()
             action = None
+            destination = None
             if k in ("pageup", "pagedown"):
                 self.show_history(len(s["turns"]) - 1 + (-5 if k == "pageup" else 5))
             elif k == "m":
-                self.show_world_map()
+                travel = self.show_world_map()
+                if travel:
+                    action, destination = travel
             elif k == "shift+m":
-                self.show_local_map()
+                travel = self.show_local_map()
+                if travel:
+                    action, destination = travel
             elif k in ("up", "down"):
                 self.show_history(len(s["turns"]) - 1 + (-1 if k == "up" else 1))
             elif k.isdigit() and 1 <= int(k) <= len(s["choices"]):
@@ -2841,7 +3043,7 @@ class Game:
                 return
             if action is not None:
                 try:
-                    self.take_turn(action)
+                    self.take_turn(action, destination=destination if k in ("m", "shift+m") else None)
                 except KeyboardInterrupt:
                     say(dim("\n  Turn cancelled - your choices are unchanged."))
                 except (OllamaError, Unavailable) as e:
@@ -3404,7 +3606,12 @@ class App:
             "and important landmarks, plus important local "
             "characters with brief descriptions, specific visible appearances, distinct outfits, jobs, "
             "personality traits, and family ties. Make the cast varied and useful for natural "
-            "conversation. Do not use real-world celebrities or existing fictional characters. The player "
+            "conversation. Do not use real-world celebrities or existing fictional characters. Generate six "
+            "to eight distinct named local characters around the starting place, with different everyday "
+            "roles and reasons to be there. The wider world should also feel inhabited: include ordinary "
+            "residents and workers at settlements and public places, and let the narrator introduce new "
+            "locals as the player visits other places. Do not treat every place as empty or reuse one "
+            "generic crowd. The player "
             "starts with modest means and practical, ordinary belongings, not substantial wealth or property. "
             "At the start there is no assigned quest, mission, urgent obligation, or mandatory objective; "
             "the player is free to explore or spend the day as they choose. Let optional leads and long "
@@ -3424,7 +3631,7 @@ class App:
             "separate; do not use generic descriptions like 'looks nice'.\n\nScenario:\n%s\n"
             "Player-selected character:\n%s\n\nAlso create useful, short loading-screen tips specific "
             "to this world's exploration, people, and play style. Tips must not spoil secrets or tell the "
-            "player what they must do. As a guide, aim for around 8-14 map locations, three or four important "
+            "player what they must do. As a guide, aim for around 8-14 map locations, six to eight important "
             "local characters, and 5-8 tips; these are suggestions, not hard limits. Use more or fewer when "
             "the scenario calls for it. Keep details focused, but do not omit or cut off useful world details "
             "to meet a length target. Complete every required field and finish the JSON response."
@@ -3491,13 +3698,14 @@ class App:
         state["world_map"] = clean_map_locations(details.get("map_locations"), p["location"])
         characters = details.get("important_characters", [])
         if isinstance(characters, list):
-            for person in characters[:6]:
+            for person in characters[:8]:
                 if not isinstance(person, dict):
                     continue
                 name = sstr(person.get("name"), 30)
                 if not name or name.lower() in [existing.lower() for existing in state["characters"]]:
                     continue
                 state["characters"].append(name)
+                state["character_locations"][name] = p["location"]
                 state["character_profiles"][name] = sstr(person.get("description"), 200)
                 traits = person.get("traits", [])
                 state["character_details"][name] = {
@@ -3513,6 +3721,7 @@ class App:
                     if isinstance(family, list) else []
                 state["relationships"][name] = {
                     "trust": 0, "affinity": 0, "respect": 0, "loyalty": 0, "notes": []}
+        state["character_rosters_generated"] = [p["location"]]
         say(dim("  Traits: %s" % (", ".join(player_character["traits"]) or "not generated")))
         say(dim("  Built a world with %d local people to meet." % len(state["characters"])))
         return state
