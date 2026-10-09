@@ -220,9 +220,10 @@ PRESETS = [
     dict(name="Medieval", blurb="gritty kingdoms, politics, a hard winter",
          tone="gritty and low-magic",
          setting="A feudal kingdom of stone keeps, muddy roads and uneasy alliances. A hard winter is closing in.",
-         role="a young squire", location="a market town below Castle Harrowmere",
-         objective="Explore the town and decide what is worth your attention.",
-         items=["small coin purse", "worn dagger", "heel of bread"]),
+         role="a poor villager", location="a remote farming village",
+         objective="Spend the day as you wish in the village.",
+         items=["patched wool tunic", "heel of stale bread", "two copper coins"],
+         keep_starting_setup=True),
     dict(name="Fantasy", blurb="wizards, ruins and waking magic",
          tone="wondrous and adventurous",
          setting="A land of floating isles, talking beasts and forgotten spells, where old magic is waking up.",
@@ -1370,10 +1371,10 @@ class Game:
         return json.dumps(snapshot, ensure_ascii=True)[:3000]
 
     # ---- helpers
-    def state_line(self):
+    def state_line(self, location=None):
         s = self.s
         return "location: %s; time: %s; health: %d/%d; carrying: %s; goal: %s" % (
-            s["location"], self.clock_label(), s["hp"], s["max_hp"],
+            location or s["location"], self.clock_label(), s["hp"], s["max_hp"],
             ", ".join(s["items"]) or "nothing", s["objective"])
 
     def ensure_local_map(self, location=None):
@@ -1461,7 +1462,13 @@ class Game:
                   "Character identity and traits: %s. Treat gender as pronoun guidance, not a personality "
                   "stereotype. The player description and generated traits should shape how the player is "
                   "perceived and described, without overriding the player's chosen identity. Write in present "
-                  "tense, aiming for about %d words in one or two short paragraphs. This length is a guide, "
+                  "tense and keep the narration anchored in the player's perspective: describe what the player "
+                  "perceives, says, thinks, and does; never switch into another character's point of view or "
+                  "state private thoughts the player cannot know. Keep dialogue and reactions grounded in what "
+                  "the player can hear or observe. The current location in the state is authoritative; when an "
+                  "action moves the player, narrate their arrival and establish the new place rather than "
+                  "continuing as if they were still at the previous one. Aim for about %d words in one or two "
+                  "short paragraphs. This length is a guide, "
                   "not a hard limit: finish the scene naturally, complete the current thought and sentence, "
                   "and do not cut off mid-action to meet the target. Describe what happens as a result of "
                   "the player's action and end at a moment that calls for a decision. Actions with people can "
@@ -1682,16 +1689,27 @@ class Game:
             }, ensure_ascii=True)[:1600]
         res = self.ai.chat("analyst", [{"role": "user", "content": prompt}], "analyse",
                            fmt=schema, options={"temperature": 0.1, "num_predict": 700 if enhanced else 120})
-        d = json.loads(res["content"])
+        try:
+            content = res.get("content") if isinstance(res, dict) else None
+            d = json.loads(content) if isinstance(content, str) else None
+        except json.JSONDecodeError:
+            d = None
+        if not isinstance(d, dict):
+            say(dim("  (analysis returned unusable output; using safe defaults)"))
+            d = {}
         mood = d.get("mood") if d.get("mood") in MOODS else "calm"
         try:
             danger = max(0, min(3, int(d.get("danger", 0))))
         except (TypeError, ValueError):
             danger = 0
-        chars = [sstr(c, 30) for c in d.get("characters", []) if sstr(c, 30)][:4]
+        characters = d.get("characters", [])
+        chars = [sstr(c, 30) for c in characters if sstr(c, 30)][:4] \
+            if isinstance(characters, list) else []
         loc = sstr(d.get("location", ""), 40)
+        if not (0 < len(loc.split()) <= 5):
+            loc = self.s["location"]
         result = {"mood": mood, "danger": danger, "characters": chars,
-                  "location": loc if 0 < len(loc.split()) <= 5 else ""}
+                  "location": loc}
         party_changes = d.get("party_changes", [])
         result["party_changes"] = [
             {"character": sstr(change.get("character"), 30),
@@ -1708,24 +1726,28 @@ class Game:
             and sstr(change.get("character"), 30)][:4] if isinstance(loyalty_changes, list) else []
         if enhanced:
             result["event"] = sstr(d.get("event"), 400) or brief(scene, 300)
-            result["character_notes"] = [
-                {"name": sstr(note.get("name"), 30), "memory": sstr(note.get("memory"), 180),
-                 "wants_remember": bool(note.get("wants_remember", True)),
-                 "importance": bounded_int(note.get("importance"), 50, 0, 100),
-                 "emotional_strength": bounded_int(note.get("emotional_strength"), 40, 0, 100),
-                 "confidence": bounded_int(note.get("confidence"), 80, 0, 100),
-                 "source": sstr(note.get("source", "observed"), 60),
-                 "valence": bounded_int(note.get("valence"), 0, -100, 100)}
-                for note in d.get("character_notes", []) if isinstance(note, dict)
-                and sstr(note.get("name"), 30) and sstr(note.get("memory"), 180)][:4]
-            result["relationships"] = [
-                {"character": sstr(rel.get("character"), 30),
-                 "trust_change": rel.get("trust_change", 0),
-                 "affinity_change": rel.get("affinity_change", 0),
-                 "respect_change": rel.get("respect_change", 0),
-                 "note": sstr(rel.get("note"), 120)}
-                for rel in d.get("relationships", []) if isinstance(rel, dict)
-                and sstr(rel.get("character"), 30)][:4]
+            character_notes = d.get("character_notes", [])
+            result["character_notes"] = (
+                [{"name": sstr(note.get("name"), 30), "memory": sstr(note.get("memory"), 180),
+                  "wants_remember": bool(note.get("wants_remember", True)),
+                  "importance": bounded_int(note.get("importance"), 50, 0, 100),
+                  "emotional_strength": bounded_int(note.get("emotional_strength"), 40, 0, 100),
+                  "confidence": bounded_int(note.get("confidence"), 80, 0, 100),
+                  "source": sstr(note.get("source", "observed"), 60),
+                  "valence": bounded_int(note.get("valence"), 0, -100, 100)}
+                 for note in character_notes if isinstance(note, dict)
+                 and sstr(note.get("name"), 30) and sstr(note.get("memory"), 180)][:4]
+                if isinstance(character_notes, list) else [])
+            relationships = d.get("relationships", [])
+            result["relationships"] = (
+                [{"character": sstr(rel.get("character"), 30),
+                  "trust_change": rel.get("trust_change", 0),
+                  "affinity_change": rel.get("affinity_change", 0),
+                  "respect_change": rel.get("respect_change", 0),
+                  "note": sstr(rel.get("note"), 120)}
+                 for rel in relationships if isinstance(rel, dict)
+                 and sstr(rel.get("character"), 30)][:4]
+                if isinstance(relationships, list) else [])
             result["character_updates"] = []
             for update in d.get("character_updates", []) if isinstance(d.get("character_updates"), list) else []:
                 if not isinstance(update, dict) or not sstr(update.get("name"), 30):
@@ -1786,12 +1808,13 @@ class Game:
         summary = tidy(res["content"])
         return (summary, s["summarized_upto"] + len(fold)) if summary else None
 
-    def make_choices(self, scene):
+    def make_choices(self, scene, location=None):
         n = self.cfg["choices"]
         system = "You write the next-action menu for an interactive story. Reply with JSON only."
         user = ("Scene:\n%s\n\nState: %s\n\nList %d different short actions (at most 8 words each, starting "
                 "with a verb) the player could take next. Make them distinct: vary cautious, bold and "
-                "clever." % (scene, self.state_line(), n))
+                "clever. Avoid repeating previous options unless still clearly relevant. Previous options: %s" %
+                (scene, self.state_line(location), n, "; ".join(self.s.get("choices", [])) or "none"))
         if self.enhanced():
             world = self.ensure_world_state()
             active = [thread["title"] for thread in world["threads"] if thread.get("status") == "active"]
@@ -2207,10 +2230,28 @@ class Game:
         turn = {"action": action or "(the story begins)", "scene": scene,
                 "mood": info.get("mood", "calm"), "danger": info.get("danger", 0)}
         folded = self.guard(self.summarize, turn, role="analyst")
-        choices = self.guard(self.make_choices, scene, role="choices") or []
         calls = []
         if cfg["tracking"] and ai.has("tools"):
             calls = self.guard(self.track, action, scene, role="tools") or []
+        next_location = starting_location
+        if info and info.get("location") and info["location"].casefold() != starting_location.casefold():
+            next_location = info["location"]
+        for call in calls:
+            fn = call.get("function", {}) if isinstance(call, dict) else {}
+            if fn.get("name") != "change_location":
+                continue
+            args = fn.get("arguments", {})
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except ValueError:
+                    continue
+            if isinstance(args, dict):
+                place = sstr(args.get("place"), 40)
+                if place and place.casefold() != starting_location.casefold():
+                    next_location = place
+                    break
+        choices = self.guard(self.make_choices, scene, next_location, role="choices") or []
         # ---- commit (nothing above touched the saved state, so Ctrl-C leaves it intact)
         notes = self.apply_calls(calls)
         if self.enhanced():
@@ -2234,7 +2275,7 @@ class Game:
             else:
                 self.apply_loyalty_changes(info)
                 self.apply_party_changes(info, action)
-            if info["location"] and not (cfg["tracking"] and ai.has("tools")):
+            if info["location"] and s["location"].casefold() == starting_location.casefold():
                 s["location"] = info["location"]
                 if info["location"] not in s.setdefault("places", []):
                     s["places"].append(info["location"])
@@ -3365,9 +3406,14 @@ class App:
             "and important landmarks, plus important local "
             "characters with brief descriptions, specific visible appearances, distinct outfits, jobs, "
             "personality traits, and family ties. Make the cast varied and useful for natural "
-            "conversation. Do not use real-world celebrities or existing fictional characters. Keep the "
-            "player's objective open-ended: exploration and conversations should reveal optional leads and "
-            "long adventures, not a mandatory delivery or urgent starting quest. Preserve the scenario's "
+            "conversation. Do not use real-world celebrities or existing fictional characters. The player "
+            "starts with modest means and practical, ordinary belongings, not substantial wealth or property. "
+            "At the start there is no assigned quest, mission, urgent obligation, or mandatory objective; "
+            "the player is free to explore or spend the day as they choose. Let optional leads and long "
+            "adventures emerge naturally from play. Unless the scenario explicitly requires another kind of "
+            "place, do not start the player inside a castle, palace, fort, or noble estate. In the Medieval "
+            "scenario, start them as a poor villager in a village, not as a squire or castle resident. "
+            "Preserve the scenario's "
             "genre and avoid contradictions. Respect the player's gender and age without inferring personality "
             "stereotypes from either; base traits primarily on their own description and give their gender "
             "only as pronoun guidance. Make traits concrete and useful: they may influence first impressions, "
@@ -3413,11 +3459,13 @@ class App:
 
         for key, limit in (("name", 40), ("tone", 100), ("setting", 500),
                            ("role", 100), ("location", 120)):
+            if scenario.get("keep_starting_setup") and key in ("role", "location"):
+                continue
             value = sstr(details.get(key), limit)
             if value:
                 p[key] = value
         generated_items = details.get("items", [])
-        if isinstance(generated_items, list):
+        if isinstance(generated_items, list) and not scenario.get("keep_starting_setup"):
             items = [sstr(item, 40) for item in generated_items if sstr(item, 40)][:6]
             if items:
                 p["items"] = items
