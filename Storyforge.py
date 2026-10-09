@@ -12,19 +12,25 @@ or x > p; edit individual models from x > 1.
   Router    smollm2:135m        classifies typed input, quick "look around" replies
 
 Low uses the original models. Medium targets 8 GB RAM / 2 GB GTX 1020 VRAM; High targets
-16 GB RAM / 6 GB RTX 2060 VRAM. Medium and High add persistent events, character memories,
-relationships, AI-driven dialogue and trades, plus the in-game u world editor. Models run
+16 GB RAM / 6 GB RTX 2060 VRAM. All modes support generated worlds and social interactions.
+Medium and High add persistent events, character memories, detailed relationship tracking,
+completed trades, and the in-game u world editor. Models run
 one after another, with profile-specific limits on how many stay loaded. Pure ASCII output, so it also looks right on a
 Linux text console or a small USB display. Needs Python 3.8+ and a running Ollama.
 
-  python3 storyforge.py                 play
-  python3 storyforge.py --benchmark     benchmark the models and exit
-  python3 storyforge.py --host 192.168.1.20:11434
+  ./storyforge.py                       play in the TUI
+  ./storyforge.py --cli                 play in classic CLI mode
+  ./storyforge.py --benchmark           benchmark the models and exit
+  ./storyforge.py --host 192.168.1.20:11434
 """
 from __future__ import annotations
 
 import argparse
 import copy
+try:
+    import curses
+except ImportError:
+    curses = None
 import datetime
 import hashlib
 import json
@@ -35,6 +41,7 @@ import shutil
 import sys
 import threading
 import time
+import textwrap
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -99,6 +106,34 @@ HF_GGUF_SOURCES = {
     "nomic-embed-text": ("nomic-ai/nomic-embed-text-v1.5-GGUF", "nomic-embed-text-v1.5.Q4_K_M.gguf"),
 }
 LENGTHS = {"short": 60, "medium": 100, "long": 160}
+NARRATION_MODES = {
+    1: ("Player's eyes", "Write entirely from the player's immediate senses and thoughts: what you see, "
+        "hear, feel, smell, and understand. Use second person throughout. Do not describe anything the "
+        "player cannot perceive or know."),
+    2: ("Balanced (default)", "Use second person as the main perspective, mixed with a little cinematic "
+        "narration for the setting, scene changes, and events. Keep the player grounded in what they "
+        "perceive, while allowing brief scene-level description."),
+    3: ("Full narration", "Use mostly literary, cinematic narration to describe scenes and events, with "
+        "only occasional direct second-person address to the player. Keep the player as the protagonist "
+        "and use their established role, gender, age, and traits consistently."),
+}
+DISPLAY_MODES = ("classic", "loading")
+DEFAULT_LOADING_TIPS = [
+    "Talk to people nearby; small conversations can reveal long adventures.",
+    "You can follow a lead, ignore it, or make your own path.",
+    "People remember meaningful kindness, harm, promises, and family ties.",
+    "Look around before deciding what deserves your attention.",
+    "Your companions have their own loyalties, worries, and goals.",
+]
+LOCAL_MAP_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "nearby_places": {"type": "array", "items": {"type": "string"}},
+        "inside_places": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["nearby_places", "inside_places"],
+}
+MAP_ICONS = {"city": "C", "village": "v", "fort": "F", "workplace": "W", "landmark": "*"}
 KEEP_ALIVES = ["1m", "5m", "30m"]
 
 DEFAULTS = {
@@ -108,6 +143,8 @@ DEFAULTS = {
     "max_loaded": None,      # None = auto from RAM
     "keep_alive": "5m",
     "length": "medium",
+    "narration_mode": 2,
+    "display_mode": "classic",
     "temperature": 0.8,
     "choices": 3,
     "recall": 3,             # 0 = off
@@ -134,6 +171,14 @@ def load_config():
         cfg["length"] = "medium"
     if cfg.get("performance_mode") not in PERFORMANCE_MODES:
         cfg["performance_mode"] = "low"
+    try:
+        cfg["narration_mode"] = int(cfg.get("narration_mode", 2))
+    except (TypeError, ValueError):
+        cfg["narration_mode"] = 2
+    if cfg["narration_mode"] not in NARRATION_MODES:
+        cfg["narration_mode"] = 2
+    if cfg.get("display_mode") not in DISPLAY_MODES:
+        cfg["display_mode"] = "classic"
     return cfg
 
 
@@ -175,61 +220,80 @@ PRESETS = [
     dict(name="Medieval", blurb="gritty kingdoms, politics, a hard winter",
          tone="gritty and low-magic",
          setting="A feudal kingdom of stone keeps, muddy roads and uneasy alliances. A hard winter is closing in.",
-         role="a young squire", location="the gates of Castle Harrowmere",
-         objective="deliver a sealed letter to the Lord of Harrowmere",
-         items=["sealed letter", "worn dagger", "heel of bread"]),
+         role="a young squire", location="a market town below Castle Harrowmere",
+         objective="Explore the town and decide what is worth your attention.",
+         items=["small coin purse", "worn dagger", "heel of bread"]),
     dict(name="Fantasy", blurb="wizards, ruins and waking magic",
          tone="wondrous and adventurous",
          setting="A land of floating isles, talking beasts and forgotten spells, where old magic is waking up.",
-         role="an apprentice mage", location="the Whispering Library",
-         objective="find the stolen spellbook of your master",
+         role="an apprentice mage", location="a village beside the Whispering Library",
+         objective="Explore the village and follow any lead that interests you.",
          items=["oak staff", "glowing pebble", "tattered notes"]),
     dict(name="Sci-fi", blurb="derelict stations and lonely stars",
          tone="tense, lonely and curious",
          setting="The year 2412. A drifting mining station orbits a dying star, and its crew has vanished.",
-         role="a salvage pilot", location="the airlock of Kepler Station",
-         objective="restore power and learn what happened to the crew",
+         role="a salvage pilot", location="the public concourse of Kepler Station",
+         objective="Explore the station and decide where to go next.",
          items=["plasma torch", "comm badge", "ration pack"]),
     dict(name="Cyberpunk", blurb="neon, corporations, dangerous data",
          tone="fast, gritty and neon-lit",
          setting="Rain-soaked megacity streets ruled by corporations, hackers and street gangs.",
-         role="a street courier", location="a noodle bar in Neon Alley",
-         objective="deliver a data chip before dawn without being caught",
-         items=["data chip", "cracked phone", "stun baton"]),
+         role="a street courier", location="a busy night market in Neon Alley",
+         objective="Explore the neighborhood and see who has a reason to talk.",
+         items=["old access card", "cracked phone", "stun baton"]),
     dict(name="Horror", blurb="creeping dread in an empty place",
          tone="slow-burn, creepy and atmospheric",
          setting="An abandoned seaside asylum where the lights flicker and the doors do not stay shut.",
-         role="a night-shift caretaker", location="the dark main hall of Blackmoor Asylum",
-         objective="find the source of the whispering and get out alive",
+         role="a night-shift caretaker", location="the gatehouse at Blackmoor Asylum",
+         objective="Take stock of the place and decide what deserves your attention.",
          items=["flashlight", "ring of keys"]),
     dict(name="Noir", blurb="rainy streets, lies, a missing person",
          tone="hard-boiled and cynical",
          setting="A rain-slicked 1940s city of smoky bars, crooked cops and secrets.",
-         role="a tired private detective", location="your cluttered office",
-         objective="find out who sent the mysterious client and what she wants",
+         role="a tired private detective", location="a rainy street outside your office",
+         objective="See what the city brings your way before choosing a lead.",
          items=["notebook", "revolver", "hip flask"]),
     dict(name="Post-apoc", blurb="scavenging in a ruined world",
          tone="bleak but hopeful",
          setting="Decades after the collapse: ruined highways, rusted towns and scattered settlements.",
-         role="a lone scavenger", location="a collapsed highway overpass",
-         objective="find clean water for your settlement",
+         role="a lone scavenger", location="a trading post built beneath a highway overpass",
+         objective="Explore the settlement and decide what matters to you.",
          items=["crowbar", "water flask", "gas mask"]),
     dict(name="Pirates", blurb="storms, treasure and mutiny",
          tone="swashbuckling and humorous",
          setting="The Sunken Sea, full of storms, cursed islands and rival crews.",
-         role="a stowaway", location="the deck of the Salt Maiden",
-         objective="uncover the secret of the captain's map",
+         role="a stowaway", location="a crowded harbor on the Sunken Sea",
+         objective="Explore the harbor and choose who, if anyone, to approach.",
          items=["rusty cutlass", "bit of rope", "lucky coin"]),
 ]
 
-SETUP_SCHEMA = {
+WORLD_SCHEMA = {
     "type": "object",
     "properties": {
         "name": {"type": "string"}, "tone": {"type": "string"}, "setting": {"type": "string"},
         "role": {"type": "string"}, "location": {"type": "string"}, "objective": {"type": "string"},
         "items": {"type": "array", "items": {"type": "string"}},
+        "world_look": {"type": "string"},
+        "cities": {"type": "array", "items": {"type": "string"}},
+        "map_locations": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"},
+            "kind": {"type": "string", "enum": ["city", "village", "fort", "workplace", "landmark"]}},
+            "required": ["name", "kind"]}},
+        "famous_people": {"type": "array", "items": {"type": "string"}},
+        "player_backstory": {"type": "string"}, "player_info": {"type": "string"},
+        "player_traits": {"type": "array", "items": {"type": "string"}},
+        "loading_tips": {"type": "array", "items": {"type": "string"}},
+        "important_characters": {"type": "array", "items": {"type": "object", "properties": {
+            "name": {"type": "string"}, "description": {"type": "string"},
+            "appearance": {"type": "string"}, "clothing": {"type": "string"},
+            "occupation": {"type": "string"},
+            "traits": {"type": "array", "items": {"type": "string"}},
+            "family": {"type": "array", "items": {"type": "string"}}},
+            "required": ["name", "description", "appearance", "clothing", "occupation", "traits", "family"]}},
     },
-    "required": ["name", "tone", "setting", "role", "location", "objective", "items"],
+    "required": ["name", "tone", "setting", "role", "location", "objective", "items", "world_look", "cities",
+                 "famous_people", "map_locations", "player_backstory", "player_info", "player_traits", "loading_tips",
+                 "important_characters"],
 }
 MOODS = ["calm", "tense", "eerie", "joyful", "sad", "action"]
 ANALYSIS_SCHEMA = {
@@ -239,8 +303,14 @@ ANALYSIS_SCHEMA = {
         "danger": {"type": "integer", "enum": [0, 1, 2, 3]},
         "characters": {"type": "array", "items": {"type": "string"}},
         "location": {"type": "string"},
+        "party_changes": {"type": "array", "items": {"type": "object", "properties": {
+            "character": {"type": "string"}, "status": {"type": "string", "enum": ["joined"]},
+            "reason": {"type": "string"}}, "required": ["character", "status", "reason"]}},
+        "loyalty_changes": {"type": "array", "items": {"type": "object", "properties": {
+            "character": {"type": "string"}, "delta": {"type": "integer"},
+            "basis": {"type": "string"}}, "required": ["character", "delta", "basis"]}},
     },
-    "required": ["mood", "danger", "characters", "location"],
+    "required": ["mood", "danger", "characters", "location", "party_changes", "loyalty_changes"],
 }
 ENHANCED_ANALYSIS_SCHEMA = {
     "type": "object",
@@ -250,6 +320,12 @@ ENHANCED_ANALYSIS_SCHEMA = {
         "characters": {"type": "array", "items": {"type": "string"}},
         "location": {"type": "string"},
         "event": {"type": "string"},
+        "party_changes": {"type": "array", "items": {"type": "object", "properties": {
+            "character": {"type": "string"}, "status": {"type": "string", "enum": ["joined"]},
+            "reason": {"type": "string"}}, "required": ["character", "status", "reason"]}},
+        "loyalty_changes": {"type": "array", "items": {"type": "object", "properties": {
+            "character": {"type": "string"}, "delta": {"type": "integer"},
+            "basis": {"type": "string"}}, "required": ["character", "delta", "basis"]}},
         "character_notes": {"type": "array", "items": {"type": "object", "properties": {
             "name": {"type": "string"}, "memory": {"type": "string"},
             "wants_remember": {"type": "boolean"}, "importance": {"type": "integer", "minimum": 0, "maximum": 100},
@@ -267,14 +343,15 @@ ENHANCED_ANALYSIS_SCHEMA = {
             "name": {"type": "string"}, "goal": {"type": "string"},
             "motivations": {"type": "array", "items": {"type": "string"}},
             "priorities": {"type": "array", "items": {"type": "string"}},
+            "family": {"type": "array", "items": {"type": "string"}},
             "knowledge": {"type": "array", "items": {"type": "object", "properties": {
                 "fact": {"type": "string"}, "confidence": {"type": "integer", "minimum": 0, "maximum": 100},
                 "source": {"type": "string"}}, "required": ["fact", "confidence", "source"]}},
             "anger_change": {"type": "integer"}, "fear_change": {"type": "integer"},
             "stress_change": {"type": "integer"}, "confidence_change": {"type": "integer"},
             "arc": {"type": "string"}, "arc_stage": {"type": "string"}},
-            "required": ["name", "goal", "motivations", "priorities", "knowledge", "anger_change", "fear_change",
-                         "stress_change", "confidence_change", "arc", "arc_stage"]}},
+            "required": ["name", "goal", "motivations", "priorities", "family", "knowledge", "anger_change",
+                         "fear_change", "stress_change", "confidence_change", "arc", "arc_stage"]}},
         "world_changes": {"type": "array", "items": {"type": "object", "properties": {
             "kind": {"type": "string", "enum": ["world", "location", "faction", "reputation", "object",
                 "fact_add", "fact_resolve", "thread_add", "thread_resolve", "foreshadow_add", "foreshadow_reference",
@@ -290,8 +367,8 @@ ENHANCED_ANALYSIS_SCHEMA = {
             "source": {"type": "string"}}, "required": ["fact", "confidence", "source"]}},
     },
     "required": ["mood", "danger", "characters", "location", "event", "character_notes", "relationships",
-                 "character_updates", "world_changes", "time_advance_minutes", "scene_objective", "scene_stakes",
-                 "player_knowledge"],
+                 "party_changes", "loyalty_changes", "character_updates", "world_changes",
+                 "time_advance_minutes", "scene_objective", "scene_stakes", "player_knowledge"],
 }
 
 
@@ -332,6 +409,7 @@ FALLBACK_CHOICES = ["Look around carefully", "Press onward", "Wait and listen", 
 
 # --------------------------------------------------------------------------- terminal helpers
 COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR") and os.environ.get("TERM", "") != "dumb"
+ACTIVE_TUI = None
 
 
 def paint(code, s):
@@ -346,12 +424,32 @@ def yellow(s): return paint("33", s)
 
 
 def term_width():
+    if ACTIVE_TUI:
+        return ACTIVE_TUI.width()
     return max(40, min(100, shutil.get_terminal_size((80, 24)).columns - 1))
 
 
 def say(s=""):
-    print(s)
-    sys.stdout.flush()
+    if ACTIVE_TUI:
+        ACTIVE_TUI.write(str(s) + "\n")
+    else:
+        print(s)
+        sys.stdout.flush()
+
+
+def clear_screen():
+    if ACTIVE_TUI:
+        ACTIVE_TUI.clear()
+        return
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[3J\033[2J\033[H")
+        sys.stdout.flush()
+
+
+def set_terminal_title(title):
+    if not ACTIVE_TUI and sys.stdout.isatty():
+        sys.stdout.write("\033]0;%s\007" % title.replace("\007", ""))
+        sys.stdout.flush()
 
 
 def rule(title="", ch="="):
@@ -362,7 +460,9 @@ def rule(title="", ch="="):
 
 
 def getkey():
-    """One keypress (lower-cased). Falls back to line input when stdin is not a terminal."""
+    """One keypress; preserve Shift+M as a distinct command."""
+    if ACTIVE_TUI:
+        return ACTIVE_TUI.getkey()
     sys.stdout.flush()
     if not sys.stdin.isatty():
         line = sys.stdin.readline()
@@ -374,11 +474,10 @@ def getkey():
         import msvcrt
         ch = msvcrt.getwch()
         if ch in ("\x00", "\xe0"):
-            msvcrt.getwch()
-            return "esc"
+            return {"H": "up", "P": "down"}.get(msvcrt.getwch(), "esc")
         if ch == "\x03":
             raise KeyboardInterrupt
-        return "\n" if ch == "\r" else ch.lower()
+        return "\n" if ch == "\r" else "shift+m" if ch == "M" else ch.lower()
     import select
     import termios
     import tty
@@ -387,15 +486,22 @@ def getkey():
     try:
         tty.setcbreak(fd)
         ch = os.read(fd, 1).decode("utf-8", "ignore")
-        if ch == "\x1b":                       # swallow the rest of an arrow-key sequence
+        if ch == "\x1b":
+            sequence = ""
             while select.select([fd], [], [], 0.03)[0]:
-                os.read(fd, 1)
+                sequence += os.read(fd, 1).decode("utf-8", "ignore")
+                if len(sequence) >= 5:
+                    break
+            if sequence.endswith("A"):
+                return "up"
+            if sequence.endswith("B"):
+                return "down"
             return "esc"
     finally:
         termios.tcsetattr(fd, termios.TCSADRAIN, old)
     if ch == "\x04":
         raise EOFError
-    return "\n" if ch in ("\r", "\n") else ch.lower()
+    return "\n" if ch in ("\r", "\n") else "shift+m" if ch == "M" else ch.lower()
 
 
 try:                                           # line editing for typed input
@@ -405,6 +511,8 @@ except ImportError:
 
 
 def ask(prompt="> "):
+    if ACTIVE_TUI:
+        return ACTIVE_TUI.ask(prompt)
     return input(prompt).strip()
 
 
@@ -414,7 +522,10 @@ class Status:
     def __init__(self, text):
         self.text, self.t0 = text, time.time()
         self.ev, self.thread = threading.Event(), None
-        if sys.stdout.isatty():
+        self.frontend = ACTIVE_TUI
+        if self.frontend:
+            self.frontend.set_status(text)
+        elif sys.stdout.isatty():
             self.thread = threading.Thread(target=self._run, daemon=True)
             self.thread.start()
 
@@ -429,10 +540,194 @@ class Status:
         if self.ev.is_set():
             return
         self.ev.set()
+        if self.frontend:
+            self.frontend.set_status("")
         if self.thread:
             self.thread.join()
             sys.stdout.write("\r\033[K")
             sys.stdout.flush()
+
+
+class TokenRateMeter:
+    def __init__(self):
+        self.started = None
+        self.characters = 0
+        self.last_update = 0.0
+        self.rate = 0.0
+        self.lock = threading.Lock()
+
+    def feed(self, piece):
+        now = time.time()
+        with self.lock:
+            if self.started is None:
+                self.started = now
+            self.characters += len(piece)
+            elapsed = max(1.0, now - self.started)
+            self.rate = self.characters / 4.0 / elapsed
+            label = "~%.1f tok/s" % self.rate
+            if now - self.last_update >= 0.25:
+                self.last_update = now
+                return label, True
+            return label, False
+
+
+class WorldGenerationProgress:
+    FIELD_LABELS = {
+        "name": "world name",
+        "tone": "world tone",
+        "setting": "world setting",
+        "role": "your role",
+        "location": "starting location",
+        "objective": "starting direction",
+        "items": "starting items",
+        "world_look": "world appearance",
+        "cities": "cities",
+        "map_locations": "cities, villages, forts, and landmarks",
+        "famous_people": "notable people",
+        "player_backstory": "your backstory",
+        "player_info": "player details",
+        "player_traits": "your traits",
+        "loading_tips": "world tips",
+        "important_characters": "important characters and their families",
+    }
+
+    def __init__(self):
+        self.started = time.time()
+        self.output = ""
+        self.keys = []
+        self.current = "world setting"
+        self.lock = threading.Lock()
+        self.done = threading.Event()
+        self.thread = None
+        self.last_refresh = 0.0
+        self.last_displayed = ""
+        self.characters = 0
+        self.rate = 0.0
+        self.token_started = None
+
+    @staticmethod
+    def _format_duration(seconds):
+        seconds = max(0, int(seconds))
+        minutes, seconds = divmod(seconds, 60)
+        return "%02d:%02d" % (minutes, seconds) if minutes else "%ds" % seconds
+
+    def _status_text(self):
+        elapsed = max(0.0, time.time() - self.started)
+        total_fields = max(1, len(WORLD_SCHEMA["properties"]))
+        completed = max(0, len(self.keys) - 1)
+        eta = "estimating"
+        if completed >= 3:
+            remaining = elapsed * (total_fields - completed) / completed
+            eta = "~" + self._format_duration(remaining)
+        return "Generating %s | Spent %s | ETA %s | ~%.1f tok/s" % (
+            self.current, self._format_duration(elapsed), eta, self.rate)
+
+    def _refresh(self, force=False):
+        text = self._status_text()
+        if not force and text == self.last_displayed:
+            return
+        now = time.time()
+        if not force and now - self.last_refresh < 0.25:
+            return
+        self.last_refresh = now
+        self.last_displayed = text
+        if ACTIVE_TUI:
+            ACTIVE_TUI.set_status(text)
+        elif sys.stdout.isatty():
+            sys.stdout.write("\r\033[K  " + text)
+            sys.stdout.flush()
+
+    def start(self):
+        self.current = "world setting"
+        self._refresh()
+        self.thread = threading.Thread(target=self._tick, daemon=True)
+        self.thread.start()
+
+    def _tick(self):
+        while not self.done.wait(1.0):
+            self._refresh()
+
+    def feed(self, piece):
+        with self.lock:
+            previous = self.current
+            self.output += piece
+            self.characters += len(piece)
+            now = time.time()
+            if self.token_started is None:
+                self.token_started = now
+            self.rate = self.characters / 4.0 / max(1.0, now - self.token_started)
+            found = re.findall(r'"([^"]+)"\s*:', self.output)
+            for key in found:
+                if key == "name" and any(section in self.keys
+                                         for section in ("map_locations", "important_characters")):
+                    continue
+                if key in self.FIELD_LABELS and key not in self.keys:
+                    self.keys.append(key)
+            if self.keys:
+                self.current = self.FIELD_LABELS[self.keys[-1]]
+        self._refresh(force=self.current != previous)
+
+    def stop(self):
+        self.done.set()
+        if self.thread:
+            self.thread.join()
+        if ACTIVE_TUI:
+            ACTIVE_TUI.set_status("")
+        elif sys.stdout.isatty():
+            sys.stdout.write("\r\033[K\n")
+            sys.stdout.flush()
+
+
+class LoadingScreen:
+    def __init__(self, tips, text="The narrator is writing"):
+        self.tips = tips or DEFAULT_LOADING_TIPS
+        self.text = text
+        self.ev = threading.Event()
+        self.thread = None
+        self.started = time.time()
+        self.rate = "~0.0 tok/s"
+
+    def update_rate(self, rate):
+        self.rate = rate
+        if ACTIVE_TUI:
+            elapsed = WorldGenerationProgress._format_duration(time.time() - self.started)
+            ACTIVE_TUI.set_status("%s | Spent %s | %s" % (self.text, elapsed, self.rate))
+
+    def start(self):
+        clear_screen()
+        if ACTIVE_TUI:
+            self.update_rate(self.rate)
+        elif sys.stdout.isatty():
+            self.thread = threading.Thread(target=self._run, daemon=True)
+            self.thread.start()
+        else:
+            say(rule("Loading"))
+            say("  %s..." % self.text)
+            say()
+            say("  Tip: %s" % self.tips[0])
+
+    def _run(self):
+        frames = "|/-\\"
+        while not self.ev.is_set():
+            elapsed = time.time() - self.started
+            tip = self.tips[int(elapsed // 4) % len(self.tips)]
+            frame = frames[int(elapsed * 4) % len(frames)]
+            sys.stdout.write("\033[H\033[2J")
+            sys.stdout.write(rule("Loading") + "\n\n")
+            sys.stdout.write("  %s %s %ds | %s\n\n" % (
+                frame, self.text, int(elapsed), self.rate))
+            sys.stdout.write("  Tip\n  %s\n\n" % textwrap.fill(tip, max(20, term_width() - 4),
+                                                              initial_indent="  ", subsequent_indent="  "))
+            sys.stdout.write(dim("  The story and its details are being prepared..."))
+            sys.stdout.flush()
+            self.ev.wait(0.25)
+
+    def stop(self):
+        self.ev.set()
+        if self.thread:
+            self.thread.join()
+        if ACTIVE_TUI:
+            ACTIVE_TUI.set_status("")
 
 
 class Wrap:
@@ -518,6 +813,61 @@ def tidy(text):
 
 def sstr(v, n):
     return str(v).strip()[:n] if isinstance(v, (str, int, float)) else ""
+
+
+def clean_map_locations(raw, start_location):
+    locations = []
+    seen = set()
+    for item in raw if isinstance(raw, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = sstr(item.get("name"), 50)
+        kind = sstr(item.get("kind"), 20).lower()
+        if name and kind in MAP_ICONS and name.casefold() not in seen:
+            locations.append({"name": name, "kind": kind})
+            seen.add(name.casefold())
+        if len(locations) >= 18:
+            break
+    if start_location and start_location.casefold() not in seen:
+        locations.insert(0, {"name": start_location[:50], "kind": "village"})
+    return locations
+
+
+def world_map_canvas(locations, current_location=""):
+    width, height = 61, 17
+    canvas = [[" " for _ in range(width)] for _ in range(height)]
+    points = []
+    for index, place in enumerate(locations[:18]):
+        name, kind = place["name"], place["kind"]
+        digest = hashlib.sha256(name.casefold().encode("utf-8")).digest()
+        x = 2 if len(locations) < 2 else 2 + index * (width - 5) // (min(len(locations), 18) - 1)
+        y = 1 + int.from_bytes(digest[:2], "big") % (height - 2)
+        while any(x == point[0] and y == point[1] for point in points):
+            y = 1 + (y % (height - 2))
+        points.append((x, y, name, kind))
+
+    def road(x, y, glyph):
+        if not (0 <= x < width and 0 <= y < height) or canvas[y][x] not in (" ", "-", "|", "+"):
+            return
+        existing = canvas[y][x]
+        canvas[y][x] = "+" if existing not in (" ", glyph) else glyph
+
+    for left, right in zip(points, points[1:]):
+        x, y = left[0], left[1]
+        target_x, target_y = right[0], right[1]
+        step = 1 if target_x >= x else -1
+        while x != target_x:
+            road(x, y, "-")
+            x += step
+        step = 1 if target_y >= y else -1
+        while y != target_y:
+            road(x, y, "|")
+            y += step
+    for x, y, name, kind in points:
+        place_name, current = name.casefold(), current_location.casefold()
+        icon = "@" if current and (place_name in current or current in place_name) else MAP_ICONS[kind]
+        canvas[y][x] = icon
+    return ["".join(row).rstrip() for row in canvas], points
 
 
 def cosine(a, b):
@@ -819,7 +1169,7 @@ class AI:
     def missing(self):
         return [(r, m) for r, m in self.cfg["models"].items() if norm(m) not in self.installed]
 
-    def chat(self, role, messages, label, stream=None, **kw):
+    def chat(self, role, messages, label, stream=None, show_status=True, **kw):
         model = self.model_for(role)
         if model is None:
             raise Unavailable(role)
@@ -827,10 +1177,11 @@ class AI:
         options = {"num_ctx": self.cfg["num_ctx"]}
         options.update(kw.pop("options", {}))
         t0 = time.time()
-        st = Status("%s [%s]" % (label, model))
+        st = Status("%s [%s]" % (label, model)) if show_status else None
 
         def on_token(piece):
-            st.stop()
+            if st:
+                st.stop()
             stream(piece)
 
         try:
@@ -842,7 +1193,8 @@ class AI:
                 raise Unavailable(role)
             raise
         finally:
-            st.stop()
+            if st:
+                st.stop()
         self.timing[label] = self.timing.get(label, 0.0) + time.time() - t0
         return res
 
@@ -923,7 +1275,14 @@ def new_state(p, mode="low"):
     return {"id": time.strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:4],
             "preset": p["name"], "tone": p["tone"], "setting": p["setting"], "role": p["role"],
             "location": p["location"], "objective": p["objective"], "items": list(p["items"]),
-            "hp": 10, "max_hp": 10, "characters": [], "summary": "", "summarized_upto": 0,
+            "hp": 10, "max_hp": 10, "characters": [], "character_profiles": {}, "character_family": {},
+            "party": [], "summary": "", "summarized_upto": 0,
+            "player_character": {"gender": "", "age": None, "description": "", "traits": []},
+            "world_building": {"world_look": "", "cities": [], "famous_people": [],
+                               "player_backstory": "", "player_info": "",
+                               "loading_tips": list(DEFAULT_LOADING_TIPS)},
+            "world_map": [{"name": p["location"], "kind": "village"}], "local_maps": {},
+            "character_details": {},
             "turns": [], "memories": [], "emb_model": None, "choices": [], "over": False,
             "performance_mode": mode, "places": [p["location"]], "events": [],
             "character_notes": {}, "relationships": {}, "character_items": {},
@@ -937,6 +1296,18 @@ def new_state(p, mode="low"):
 class Game:
     def __init__(self, app, state):
         self.app, self.ai, self.cfg, self.s = app, app.ai, app.cfg, state
+        self.s.setdefault("character_profiles", {})
+        self.s.setdefault("character_family", {})
+        self.s.setdefault("character_details", {})
+        self.s.setdefault("party", [])
+        self.s.setdefault("world_building", {})
+        self.s.setdefault("player_character", {"gender": "", "age": None, "description": "", "traits": []})
+        self.s.setdefault("world_map", [{"name": self.s.get("location", "Starting place"), "kind": "village"}])
+        self.s.setdefault("local_maps", {})
+        for key, default in (("world_look", ""), ("cities", []), ("famous_people", []),
+                             ("player_backstory", ""), ("player_info", ""),
+                             ("loading_tips", list(DEFAULT_LOADING_TIPS))):
+            self.s["world_building"].setdefault(key, default)
 
     def enhanced(self):
         return self.s.get("performance_mode", self.cfg.get("performance_mode", "low")) in ("medium", "high")
@@ -956,6 +1327,30 @@ class Game:
         memories = [m for m in memories if m]
         memories.sort(key=lambda m: memory_retention_score(m, relation, len(s.get("turns", []))), reverse=True)
         return memories[:limit]
+
+    def relationship_impression(self, name):
+        relation = self.s.get("relationships", {}).get(name, {})
+        standing = sum(relation.get(key, 0) for key in ("trust", "affinity", "respect")) / 3.0
+        if standing >= 45:
+            impression = "they trust and warmly welcome the player"
+        elif standing >= 15:
+            impression = "they are becoming comfortable with the player"
+        elif standing <= -45:
+            impression = "they strongly distrust or resent the player"
+        elif standing <= -15:
+            impression = "they remain wary of the player"
+        else:
+            impression = "they have not formed a strong opinion of the player"
+        loyalty = relation.get("loyalty", 0)
+        if loyalty >= 45:
+            impression += " and feel deeply committed to them"
+        elif loyalty >= 15:
+            impression += " and are beginning to feel a sense of loyalty"
+        elif loyalty <= -15:
+            impression += " but feel little obligation to stand by them"
+        else:
+            impression += "; their loyalty is still untested"
+        return impression
 
     def world_context(self):
         world = self.s.get("world_state", {})
@@ -980,6 +1375,47 @@ class Game:
         return "location: %s; time: %s; health: %d/%d; carrying: %s; goal: %s" % (
             s["location"], self.clock_label(), s["hp"], s["max_hp"],
             ", ".join(s["items"]) or "nothing", s["objective"])
+
+    def ensure_local_map(self, location=None):
+        location = location or self.s["location"]
+        maps = self.s.setdefault("local_maps", {})
+        saved_key = next((key for key in maps if key.casefold() == location.casefold()), None)
+        if saved_key is not None:
+            return maps[saved_key]
+
+        fallback = {"nearby_places": [], "inside_places": ["Exit"]}
+        prompt = (
+            "Create a concise local place directory for an interactive story. Return only simple place names "
+            "in the two requested lists; do not draw ASCII, maps, roads, routes, or coordinates. Include 3-7 "
+            "plausible special places nearby (such as an inn, tavern, pool, market, workplace, or landmark) "
+            "and 2-6 places inside the current location (such as an entrance, bedroom, bathroom, office, or "
+            "common room). The player must be able to leave; the program adds Exit automatically. Keep the "
+            "lists consistent with the location and setting and do not invent urgent quests.\n\n"
+            "Current location: %s\nSetting: %s\nWorld details: %s\nKnown world-map places: %s" % (
+                location, self.s.get("setting", ""),
+                brief(self.s.get("world_building", {}).get("world_look", ""), 300),
+                ", ".join(place["name"] for place in self.s.get("world_map", [])))
+        )
+        try:
+            response = self.ai.chat("narrator", [{"role": "user", "content": prompt}], "local map",
+                                    fmt=LOCAL_MAP_SCHEMA, options={"temperature": 0.4, "num_predict": 180})
+            details = json.loads(response["content"])
+            if not isinstance(details, dict):
+                raise ValueError("local map response was not an object")
+            nearby = details.get("nearby_places", [])
+            inside = details.get("inside_places", [])
+            nearby = [sstr(name, 60) for name in nearby if sstr(name, 60)] \
+                if isinstance(nearby, list) else []
+            inside = [sstr(name, 60) for name in inside if sstr(name, 60)] \
+                if isinstance(inside, list) else []
+            fallback = {"nearby_places": list(dict.fromkeys(nearby))[:10],
+                        "inside_places": list(dict.fromkeys(
+                            ["Exit"] + [name for name in inside if name.casefold() != "exit"]))[:10]}
+        except (OllamaError, Unavailable, ValueError, AttributeError, TypeError) as error:
+            say(dim("  Local places could not be generated (%s); Exit remains available." %
+                    str(error)[:90]))
+        maps[location] = fallback
+        return fallback
 
     def guard(self, fn, *args, role=None):
         """Run an optional pipeline stage; a failure skips the stage instead of the turn."""
@@ -1017,21 +1453,78 @@ class Game:
     def narrate(self, action, recalled):
         s, cfg = self.s, self.cfg
         words = LENGTHS[cfg["length"]]
+        player = s.get("player_character", {})
+        narration_style = NARRATION_MODES.get(cfg.get("narration_mode", 2), NARRATION_MODES[2])[1]
+        recent_turns = s.get("turns", [])[-5:]
         system = ("You are the narrator of an interactive story. Genre: %s. Tone: %s.\nWorld: %s\n"
-                  "The player is %s. Write in second person, present tense, about %d words in one or two "
-                  "short paragraphs. Describe only what happens as a result of the player's action and end "
-                  "at a moment that calls for a decision. Never list options, never use markdown, never "
-                  "speak outside the story." % (s["preset"], s["tone"], s["setting"], s["role"], words))
+                  "The player is %s. Narration mode: %s\n"
+                  "Character identity and traits: %s. Treat gender as pronoun guidance, not a personality "
+                  "stereotype. The player description and generated traits should shape how the player is "
+                  "perceived and described, without overriding the player's chosen identity. Write in present "
+                  "tense, aiming for about %d words in one or two short paragraphs. This length is a guide, "
+                  "not a hard limit: finish the scene naturally, complete the current thought and sentence, "
+                  "and do not cut off mid-action to meet the target. Describe what happens as a result of "
+                  "the player's action and end at a moment that calls for a decision. Actions with people can "
+                  "create lasting turns in "
+                  "the story—alliances, betrayals, revelations, or new journeys—but make major pivots rare "
+                  "and grounded in meaningful choices. Most conversations should stay ordinary and human. "
+                  "Maintain strict continuity. Treat the established story, people, locations, current goals, "
+                  "and consequences as canonical. Do not introduce a new person, place, urgent problem, quest, "
+                  "or mystery merely to make something happen; add new elements only when the player's action "
+                  "or an established consequence gives a clear reason. Develop existing leads gradually, and "
+                  "do not reset, contradict, or forget recent events.\n"
+                  "Let characters convey how they feel about the player through natural words and behavior, "
+                  "never relationship scores. Never list options, never use markdown, never speak outside "
+                  "the story." % (s["preset"], s["tone"], s["setting"], s["role"], narration_style,
+                                  json.dumps(player, ensure_ascii=True), words))
         parts = []
+        world_building = s.get("world_building", {})
+        if any(world_building.get(key) for key in (
+                "world_look", "cities", "famous_people", "player_backstory", "player_info")):
+            parts.append("World and player details (keep consistent): " + json.dumps(
+                world_building, ensure_ascii=True))
+        if s.get("world_map"):
+            parts.append("Established world-map locations (keep names and kinds consistent): " +
+                         json.dumps(s["world_map"], ensure_ascii=True))
+        if player.get("description") or player.get("traits"):
+            parts.append("Player-created character details (respect these in narration and reactions): "
+                         + json.dumps(player, ensure_ascii=True))
+        if s.get("character_profiles"):
+            parts.append("Important people and their backgrounds: " + json.dumps(
+                s["character_profiles"], ensure_ascii=True))
+        if s.get("character_details"):
+            parts.append("Known physical descriptions, clothing, occupations, and traits of important people: "
+                         + json.dumps(s["character_details"], ensure_ascii=True))
+        if s.get("character_family"):
+            parts.append("Known character family ties: " + json.dumps(s["character_family"], ensure_ascii=True))
+        if s.get("party"):
+            parts.append("Traveling party: " + ", ".join(s["party"]))
         if s["summary"]:
             parts.append("Story so far: " + s["summary"])
         if recalled:
             parts.append("Earlier events that may matter:\n" + "\n".join("- " + brief(r, 200) for r in recalled))
-        if s["turns"]:
-            parts.append("Previous scene: " + brief(s["turns"][-1]["scene"], 500))
+        if recent_turns:
+            history = "\n\n".join(
+                "Turn %d\nPlayer action: %s\nWhat happened: %s" % (
+                    max(1, len(s["turns"]) - len(recent_turns) + index + 1),
+                    brief(turn.get("action", ""), 180), brief(turn.get("scene", ""), 450))
+                for index, turn in enumerate(recent_turns))
+            parts.append("Recent story events, in order (canonical; continue from the last one):\n" + history)
         parts.append("Current state - " + self.state_line())
         if s["characters"]:
             parts.append("Known characters: " + ", ".join(s["characters"]))
+        social_context = []
+        for name in s["characters"]:
+            details = name + ": " + self.relationship_impression(name)
+            if s.get("character_profiles", {}).get(name):
+                details += "; " + s["character_profiles"][name]
+            family = s.get("character_family", {}).get(name, [])
+            if family:
+                details += "; family: " + ", ".join(family)
+            social_context.append(details)
+        if social_context:
+            parts.append("Social context for natural characterization (never state these as scores): "
+                         + " | ".join(social_context))
         if self.enhanced():
             parts.append("Persistent world state (authoritative; only explicit consequences change it): "
                          + self.world_context())
@@ -1045,11 +1538,8 @@ class Game:
                 line = name
                 if notes:
                     line += " remembers: " + "; ".join(note["text"] for note in notes)
-                if relation:
-                    line += " (trust %d, affinity %d, respect %d/100)" % (
-                        relation.get("trust", 0), relation.get("affinity", 0), relation.get("respect", 0))
-                    if relation.get("notes"):
-                        line += "; relationship: " + "; ".join(relation["notes"][-2:])
+                if relation and relation.get("notes"):
+                    line += "; things between them: " + "; ".join(relation["notes"][-2:])
                 if s.get("character_goals", {}).get(name):
                     line += "; current goal: " + s["character_goals"][name]
                 if s.get("character_motivations", {}).get(name):
@@ -1076,18 +1566,61 @@ class Game:
                          "or scheduled events when these goals call for it. Reintroduce an active thread when it "
                          "fits the current scene, without forcing every thread into every scene.")
         if action is None:
-            parts.append("Begin the story. Introduce the setting and the player's situation at %s, "
-                         "with the goal: %s." % (s["location"], s["objective"]))
+            parts.append("Open on a walkable, lived-in place at %s. Establish the world through concrete "
+                         "sensory details and a few people going about their lives; bring at least one named "
+                         "important local into view naturally. Give the player room to "
+                         "look around and choose whom to approach. Do not start with an assigned delivery, "
+                         "urgent mission, or mandatory quest; let longer adventures emerge naturally from "
+                         "exploration and conversations." % s["location"])
         else:
             parts.append("The player's action: %s\nContinue the story." % action)
-            if self.enhanced() and action.lower().startswith("the player asks to trade:"):
-                parts.append("Let the relevant character answer the trade proposal naturally. Only narrate an "
+            if self.enhanced() and (
+                    " to trade:" in action.lower() or action.lower().startswith("the player asks to trade:")):
+                parts.append("Let the named character answer the player's trade proposal naturally. Only narrate an "
                              "exchange if that character agrees; make refused or unresolved offers clear.")
+            if action.lower().startswith("the player invites "):
+                parts.append("Treat joining the party as the character's choice. They may accept or decline "
+                             "for believable reasons, including their existing loyalties, priorities, and "
+                             "concerns for their family.")
+            if action.lower().startswith("the player parts ways with "):
+                parts.append("Show a natural, grounded farewell and the character's human reaction. The player "
+                             "has ended the traveling arrangement; do not force a dramatic twist.")
         msgs = [{"role": "system", "content": system}, {"role": "user", "content": "\n\n".join(parts)}]
+        loading_mode = cfg.get("display_mode", "classic") == "loading"
+        loading = LoadingScreen(world_building.get("loading_tips", DEFAULT_LOADING_TIPS)) if loading_mode else None
+        if loading:
+            loading.start()
+        else:
+            clear_screen()
         wrap = Wrap(term_width())
-        res = self.ai.chat("narrator", msgs, "narrate", stream=wrap.feed if cfg["stream"] else None,
-                           options={"temperature": cfg["temperature"], "num_predict": int(words * 1.9) + 40})
-        if not cfg["stream"]:
+
+        meter = TokenRateMeter()
+
+        def on_token(piece):
+            rate, refresh = meter.feed(piece)
+            if refresh:
+                if loading:
+                    loading.update_rate(rate)
+                elif ACTIVE_TUI:
+                    ACTIVE_TUI.set_status("Narrator writing | %s" % rate)
+                else:
+                    set_terminal_title("StoryForge | %s" % rate)
+            if cfg["stream"] and not loading_mode:
+                wrap.feed(piece)
+
+        try:
+            res = self.ai.chat("narrator", msgs, "narrate",
+                               stream=on_token,
+                               show_status=not loading_mode,
+                               options={"temperature": cfg["temperature"],
+                                        "num_predict": -1})
+        finally:
+            if loading:
+                loading.stop()
+            set_terminal_title("StoryForge")
+        if loading_mode:
+            clear_screen()
+        if not cfg["stream"] or loading_mode:
             wrap.feed(res["content"])
         wrap.close()
         text = tidy(res["content"])
@@ -1098,18 +1631,31 @@ class Game:
     def analyze(self, scene):
         prompt = ("Read this story passage and fill in: mood; danger (0 safe, 1 uneasy, 2 risky, 3 deadly); "
                   "characters (people or creatures present, at most 4, short names); location (at most 5 "
-                  "words).\n\nPassage:\n" + scene)
+                  "words). For party_changes, report joined only when the scene explicitly confirms they "
+                  "accepted an invitation; otherwise return an empty list. "
+                  "Do not infer acceptance from politeness or an unresolved offer. For loyalty_changes, use "
+                  "small deltas (-10..10) only for meaningful actions involving a character's safety, family, "
+                  "or a major shared commitment. Ordinary conversations and routine actions have no loyalty "
+                  "change. Give a brief, passage-grounded basis; consider past trust, family ties, and shared "
+                  "history. Otherwise return an empty list.\n\nPassage:\n" + scene)
         enhanced = self.enhanced()
         schema = ANALYSIS_SCHEMA
         if enhanced:
             prompt += ("\n\nAlso provide one concise persistent event summary. For each character in the scene, "
-                       "record only supported changes to goals, motivations, knowledge, emotions, and arcs. "
+                       "record only supported changes to goals, motivations, family ties, knowledge, emotions, "
+                       "and arcs. Add family members only when the passage supports the relationship. "
                        "Knowledge is private: include only facts that character witnessed or was told, with "
                        "confidence 0-100 and source. Do not give one character another's knowledge. For new "
                        "memories, estimate importance, emotional strength, confidence, valence toward the player, "
                        "and whether this character wants to remember it. Update trust, affinity, and respect by "
-                       "small deltas (-10..10); emotion changes are also deltas. Propose world changes only when "
-                       "the passage explicitly causes them. Add or resolve plot threads and foreshadowing only "
+                       "small deltas (-10..10). For loyalty_changes, use small deltas (-10..10) only rarely, "
+                       "for a meaningful action that affects the character's safety, family, or a major shared "
+                       "commitment; ordinary conversations usually have zero change. Loyalty is based on trust, "
+                       "actions toward family, and shared history, not just friendliness. For party_changes, "
+                       "report joined only when an explicitly invited character clearly accepts; never infer "
+                       "acceptance. Emotion changes "
+                       "are also deltas. Propose world changes only when the passage explicitly causes them. "
+                       "Add or resolve plot threads and foreshadowing only "
                        "when supported. For world_changes use only: world fields weather/political_state/date/"
                        "alert_level; location fields condition/owner/details/known_event/guards; faction fields "
                        "influence or relation:OtherFaction; reputation fields reputation/fear/respect/fame/"
@@ -1121,11 +1667,19 @@ class Game:
                        "clear cause and delay exist. Advance story time plausibly. Current persistent state: %s" %
                        json.dumps({"world": self.s.get("world_state", {}),
                                    "relationships": self.s.get("relationships", {}),
+                                   "character_family": self.s.get("character_family", {}),
+                                   "party": self.s.get("party", []),
                                    "character_goals": self.s.get("character_goals", {}),
                                    "character_priorities": self.s.get("character_priorities", {}),
                                    "character_emotions": self.s.get("character_emotions", {}),
                                    "character_arcs": self.s.get("character_arcs", {})}, ensure_ascii=True)[:3000])
             schema = ENHANCED_ANALYSIS_SCHEMA
+        else:
+            prompt += "\n\nCurrent social context for tracking loyalty, not for output: " + json.dumps({
+                "relationships": self.s.get("relationships", {}),
+                "character_family": self.s.get("character_family", {}),
+                "relationship_history": self.s.get("relationship_history", [])[-12:],
+            }, ensure_ascii=True)[:1600]
         res = self.ai.chat("analyst", [{"role": "user", "content": prompt}], "analyse",
                            fmt=schema, options={"temperature": 0.1, "num_predict": 700 if enhanced else 120})
         d = json.loads(res["content"])
@@ -1138,6 +1692,20 @@ class Game:
         loc = sstr(d.get("location", ""), 40)
         result = {"mood": mood, "danger": danger, "characters": chars,
                   "location": loc if 0 < len(loc.split()) <= 5 else ""}
+        party_changes = d.get("party_changes", [])
+        result["party_changes"] = [
+            {"character": sstr(change.get("character"), 30),
+             "status": sstr(change.get("status"), 20),
+             "reason": sstr(change.get("reason"), 120)}
+            for change in party_changes if isinstance(change, dict)
+            and sstr(change.get("character"), 30)][:4] if isinstance(party_changes, list) else []
+        loyalty_changes = d.get("loyalty_changes", [])
+        result["loyalty_changes"] = [
+            {"character": sstr(change.get("character"), 30),
+             "delta": bounded_int(change.get("delta"), 0, -10, 10),
+             "basis": sstr(change.get("basis"), 120)}
+            for change in loyalty_changes if isinstance(change, dict)
+            and sstr(change.get("character"), 30)][:4] if isinstance(loyalty_changes, list) else []
         if enhanced:
             result["event"] = sstr(d.get("event"), 400) or brief(scene, 300)
             result["character_notes"] = [
@@ -1169,6 +1737,8 @@ class Game:
                                     if sstr(x, 100)][:4] if isinstance(update.get("motivations"), list) else [],
                     "priorities": [sstr(x, 100) for x in update.get("priorities", [])
                                    if sstr(x, 100)][:5] if isinstance(update.get("priorities"), list) else [],
+                    "family": [sstr(x, 80) for x in update.get("family", [])
+                               if sstr(x, 80)][:5] if isinstance(update.get("family"), list) else [],
                     "knowledge": [{"fact": sstr(item.get("fact"), 180),
                                    "confidence": bounded_int(item.get("confidence"), 50, 0, 100),
                                    "source": sstr(item.get("source"), 60)}
@@ -1463,6 +2033,7 @@ class Game:
 
     def apply_character_updates(self, updates):
         s, turn = self.s, len(self.s["turns"]) + 1
+        s.setdefault("character_family", {})
         for update in updates:
             name = self.character_key(update["name"])
             if name.lower() not in [c.lower() for c in s["characters"]] and len(s["characters"]) < 8:
@@ -1473,6 +2044,8 @@ class Game:
                 s["character_motivations"][name] = update["motivations"]
             if update.get("priorities"):
                 s.setdefault("character_priorities", {})[name] = update["priorities"]
+            if update.get("family"):
+                s["character_family"][name] = update["family"]
             knowledge = s["character_knowledge"].setdefault(name, [])
             for fact in update["knowledge"]:
                 if fact["fact"].lower() not in [k["fact"].lower() for k in knowledge]:
@@ -1494,7 +2067,7 @@ class Game:
                     arc["stage"] = update["arc_stage"]
                 del arc["history"][:-12]
 
-    def apply_analysis(self, info):
+    def apply_analysis(self, info, action=""):
         s = self.s
         self.ensure_world_state()
         s.setdefault("character_notes", {})
@@ -1510,7 +2083,7 @@ class Game:
         for relationship in info.get("relationships", []):
             name = self.character_key(relationship["character"])
             relation = s["relationships"].setdefault(name, {
-                "trust": 0, "affinity": 0, "respect": 0, "notes": []})
+                "trust": 0, "affinity": 0, "respect": 0, "loyalty": 0, "notes": []})
             changes = {}
             for dimension in ("trust", "affinity", "respect"):
                 delta = bounded_int(relationship.get(dimension + "_change"), 0, -10, 10)
@@ -1557,11 +2130,53 @@ class Game:
             s["character_notes"][name] = normalized[:12]
         for change in info.get("world_changes", []):
             self.apply_world_change(change)
+        self.apply_loyalty_changes(info)
+        self.apply_party_changes(info, action)
         world = self.ensure_world_state()
         world["scene"] = {"objective": info.get("scene_objective", ""),
                            "stakes": info.get("scene_stakes", ""),
                            "participants": info.get("characters", [])}
         self.advance_story_time(info.get("time_advance_minutes", 10))
+
+    def apply_loyalty_changes(self, info):
+        self.s.setdefault("relationships", {})
+        self.s.setdefault("relationship_history", [])
+        for change in info.get("loyalty_changes", []):
+            name = self.character_key(change.get("character", ""))
+            if not name:
+                continue
+            delta = bounded_int(change.get("delta"), 0, -10, 10)
+            if not delta:
+                continue
+            relation = self.s["relationships"].setdefault(name, {
+                "trust": 0, "affinity": 0, "respect": 0, "loyalty": 0, "notes": []})
+            relation["loyalty"] = bounded_int(relation.get("loyalty", 0) + delta, 0, -100, 100)
+            self.s["relationship_history"].append({
+                "turn": len(self.s.get("turns", [])) + 1, "character": name,
+                "changes": {"loyalty": delta}, "note": sstr(change.get("basis"), 120),
+                "scores": {"loyalty": relation["loyalty"]}})
+        del self.s["relationship_history"][:-100]
+
+    def apply_party_changes(self, info, action=""):
+        invitation = re.match(r"the player invites (.+?) to join the party", action or "", re.IGNORECASE)
+        departure = re.match(r"the player parts ways with (.+?)[.!]?$", action or "", re.IGNORECASE)
+        party = self.s.setdefault("party", [])
+        if departure:
+            name = self.character_key(departure.group(1))
+            self.s["party"] = [member for member in party if member.lower() != name.lower()]
+            return
+        if not invitation:
+            return
+        name = self.character_key(invitation.group(1))
+        people = [person.lower() for person in self.s.get("characters", [])]
+        confirmed = any(
+            self.character_key(change.get("character", "")).lower() == name.lower()
+            and change.get("status") == "joined"
+            for change in info.get("party_changes", []))
+        if name.lower() not in people or not confirmed:
+            return
+        if name.lower() not in [member.lower() for member in party] and len(party) < 4:
+            party.append(name)
 
     def epilogue(self):
         s = self.s
@@ -1580,6 +2195,7 @@ class Game:
     # ---- one full turn
     def take_turn(self, action):
         s, ai, cfg = self.s, self.ai, self.cfg
+        starting_location = s.get("location", "")
         ai.timing = {}
         t0 = time.time()
         recalled = []
@@ -1613,12 +2229,17 @@ class Game:
                     s["characters"].append(c)
             s["characters"] = s["characters"][-8:]
             if self.enhanced():
-                self.apply_analysis(info)
+                self.apply_analysis(info, action)
                 s["characters"] = s["characters"][-8:]
+            else:
+                self.apply_loyalty_changes(info)
+                self.apply_party_changes(info, action)
             if info["location"] and not (cfg["tracking"] and ai.has("tools")):
                 s["location"] = info["location"]
                 if info["location"] not in s.setdefault("places", []):
                     s["places"].append(info["location"])
+        if s.get("location", "").casefold() != starting_location.casefold():
+            self.ensure_local_map(s["location"])
         if folded:
             s["summary"], s["summarized_upto"] = folded
         s["turns"].append(turn)
@@ -1688,12 +2309,33 @@ class Game:
         s = self.s
         say()
         say("  Role:      %s" % s["role"])
+        player = s.get("player_character", {})
+        if player.get("gender") or player.get("age") is not None:
+            say("  Character: %s, age %s" % (player.get("gender") or "unspecified",
+                                               player.get("age", "unspecified")))
+        if player.get("description"):
+            say("  Appearance: %s" % player["description"])
+        if player.get("traits"):
+            say("  Traits:    %s" % ", ".join(player["traits"]))
+        world_building = s.get("world_building", {})
+        if world_building.get("player_backstory"):
+            say("  Background: %s" % world_building["player_backstory"])
+        if world_building.get("player_info"):
+            say("  About you:  %s" % world_building["player_info"])
+        if world_building.get("world_look"):
+            say("  World:      %s" % world_building["world_look"])
+        if world_building.get("cities"):
+            say("  Cities:     %s" % ", ".join(world_building["cities"]))
+        if world_building.get("famous_people"):
+            say("  Notable:    %s" % ", ".join(world_building["famous_people"]))
         say("  Location:  %s" % s["location"])
         say("  Health:    %d/%d" % (s["hp"], s["max_hp"]))
         say("  Carrying:  %s" % (", ".join(s["items"]) or "nothing"))
-        say("  Goal:      %s" % s["objective"])
+        say("  Direction: %s" % s["objective"])
         if s["characters"]:
-            say("  Met:       %s" % ", ".join(s["characters"]))
+            say("  People:    %s" % ", ".join(s["characters"]))
+        if s.get("party"):
+            say("  Party:     %s" % ", ".join(s["party"]))
         if self.enhanced():
             world = self.ensure_world_state()
             say("  World:     %s | %s | alert %d/5" % (
@@ -1758,19 +2400,17 @@ class Game:
 
     def customize(self):
         while True:
+            clear_screen()
             say()
             say(rule("Customize story"))
             say("  1) Places and setting")
             say("  2) Characters and memories")
-            say("  3) Relationships")
             say(dim("  u/x back"))
             key = getkey()
             if key == "1":
                 self.edit_places()
             elif key == "2":
                 self.edit_characters()
-            elif key == "3":
-                self.edit_relationships()
             elif key in ("u", "x", "q", "esc", "\n"):
                 self.app.save_state(self.s)
                 return
@@ -1781,6 +2421,7 @@ class Game:
         if s["location"] not in places:
             places.append(s["location"])
         while True:
+            clear_screen()
             say()
             say(rule("Places"))
             say("  Setting: %s" % s["setting"])
@@ -1822,16 +2463,14 @@ class Game:
         s.setdefault("relationships", {})
         s.setdefault("character_items", {})
         while True:
+            clear_screen()
             say()
             say(rule("Characters"))
             for i, name in enumerate(s["characters"], 1):
-                relation = s["relationships"].get(name, {})
                 memories = self.character_memories(name, 2)
-                say("  %d) %s%s" % (i, name, " - " + "; ".join(m["text"] for m in memories)
-                                    if memories else ""))
-                if relation:
-                    say(dim("     trust %d  affinity %d  respect %d" % (
-                        relation.get("trust", 0), relation.get("affinity", 0), relation.get("respect", 0))))
+                say("  %d) %s%s%s" % (
+                    i, name, " (traveling with you)" if name in s.get("party", []) else "",
+                    " - " + "; ".join(m["text"] for m in memories) if memories else ""))
             say(dim("  number edit  a add  d delete  x back"))
             key = getkey()
             if key == "a":
@@ -1839,15 +2478,18 @@ class Game:
                 if name and name.lower() not in [c.lower() for c in s["characters"]]:
                     s["characters"].append(name)
                     s["character_notes"][name] = []
-                    s["relationships"][name] = {"trust": 0, "affinity": 0, "respect": 0, "notes": []}
+                    s["relationships"][name] = {
+                        "trust": 0, "affinity": 0, "respect": 0, "loyalty": 0, "notes": []}
             elif key == "d":
                 raw = ask("  Character number to delete> ")
                 if raw.isdigit() and 1 <= int(raw) <= len(s["characters"]):
                     name = s["characters"].pop(int(raw) - 1)
+                    s["party"] = [member for member in s.get("party", []) if member != name]
                     for field in ("character_notes", "relationships", "character_items", "character_goals",
                                   "character_motivations", "character_priorities", "character_knowledge",
-                                  "character_emotions", "character_arcs"):
-                        s[field].pop(name, None)
+                                  "character_emotions", "character_arcs", "character_profiles",
+                                  "character_family", "character_details"):
+                        s.setdefault(field, {}).pop(name, None)
             elif key.isdigit() and 1 <= int(key) <= len(s["characters"]):
                 old = s["characters"][int(key) - 1]
                 name = ask("  Rename '%s' (Enter keeps)> " % old)[:30] or old
@@ -1855,48 +2497,120 @@ class Game:
                 s["characters"][int(key) - 1] = name
                 for field in ("character_notes", "relationships", "character_items", "character_goals",
                               "character_motivations", "character_priorities", "character_knowledge",
-                              "character_emotions", "character_arcs"):
+                              "character_emotions", "character_arcs", "character_profiles",
+                              "character_family", "character_details"):
+                    s.setdefault(field, {})
                     if old != name and old in s[field]:
                         s[field][name] = s[field].pop(old)
+                s["party"] = [name if member == old else member for member in s.get("party", [])]
                 if description:
                     s["character_notes"].setdefault(name, []).append(description)
                     del s["character_notes"][name][:-8]
                 if name not in s["relationships"]:
-                    s["relationships"][name] = {"trust": 0, "affinity": 0, "respect": 0, "notes": []}
+                    s["relationships"][name] = {
+                        "trust": 0, "affinity": 0, "respect": 0, "loyalty": 0, "notes": []}
             elif key in ("x", "q", "esc", "\n"):
                 return
 
-    def edit_relationships(self):
-        s = self.s
-        s.setdefault("relationships", {})
+    def talk_to_person(self, name):
+        topic = ask("  What would you like to talk about with %s? (Enter to get to know them)> " % name)
+        topic = topic[:180] or "get to know them"
+        return "The player talks with %s about: %s." % (name, topic)
+
+    def show_character_info(self, name):
+        details = self.s.get("character_details", {}).get(name, {})
+        clear_screen()
+        say(rule("What you know about %s" % name))
+        fields = (("Looks", details.get("appearance")),
+                  ("Clothing", details.get("clothing")),
+                  ("Job", details.get("occupation")),
+                  ("About", self.s.get("character_profiles", {}).get(name)))
+        shown = False
+        for label, value in fields:
+            if value:
+                say("  %-10s %s" % (label + ":", value))
+                shown = True
+        traits = details.get("traits", [])
+        if traits:
+            say("  %-10s %s" % ("Traits:", ", ".join(traits)))
+            shown = True
+        family = self.s.get("character_family", {}).get(name, [])
+        if family:
+            say("  %-10s %s" % ("Family:", ", ".join(family)))
+            shown = True
+        if not shown:
+            say("  You do not know much about them yet.")
+        say()
+        say(dim("  Press any key to return."))
+        getkey()
+
+    def trade_with_person(self, name):
+        if not self.enhanced():
+            say(dim("  Trading is available in Medium and High performance modes."))
+            return None
+        offer = ask("  What would you offer, and what would you ask for?> ")[:180]
+        if not offer:
+            return None
+        return "The player asks %s to trade: %s." % (name, offer)
+
+    def interact_with_person(self, name, talk_only=False):
         while True:
+            clear_screen()
+            in_party = name.lower() in [member.lower() for member in self.s.get("party", [])]
             say()
-            say(rule("Relationships"))
+            say(rule(name))
+            say("  1) Info")
+            say("  2) Talk")
+            if not talk_only:
+                say("  3) Ask about a trade")
+                if in_party:
+                    say("  4) Part ways")
+                else:
+                    say("  4) Invite them to join your party")
+            say(dim("  x back"))
+            key = getkey()
+            if key == "1":
+                self.show_character_info(name)
+            elif key == "2":
+                return self.talk_to_person(name)
+            elif key == "3" and not talk_only:
+                action = self.trade_with_person(name)
+                if action:
+                    return action
+            elif key == "4" and not talk_only:
+                if in_party:
+                    return "The player parts ways with %s." % name
+                if len(self.s.get("party", [])) >= 4:
+                    say(dim("  Your party is full; you can travel with up to four companions."))
+                    continue
+                return "The player invites %s to join the party." % name
+            elif key in ("x", "q", "esc", "\n"):
+                return None
+
+    def people_menu(self, select_to_talk=False):
+        s = self.s
+        while True:
+            clear_screen()
+            say()
+            say(rule("People"))
+            if not s["characters"]:
+                say("  You have not met anyone yet. Explore the scene to meet people.")
             for i, name in enumerate(s["characters"], 1):
-                relation = s["relationships"].setdefault(name, {
-                    "trust": 0, "affinity": 0, "respect": 0, "notes": []})
-                say("  %d) %-20s trust %+d  affinity %+d  respect %+d" % (
-                    i, name[:20], relation.get("trust", 0), relation.get("affinity", 0),
-                    relation.get("respect", 0)))
-            say(dim("  number edit scores/notes  x back"))
+                say("  %d) %s%s" % (
+                    i, name, " - traveling with you" if name.lower() in
+                    [member.lower() for member in s.get("party", [])] else ""))
+            say(dim("  Choose someone to speak with; x back" if select_to_talk else
+                    "  Choose a person to talk, trade, or invite to your party; x back"))
             key = getkey()
             if key.isdigit() and 1 <= int(key) <= len(s["characters"]):
                 name = s["characters"][int(key) - 1]
-                relation = s["relationships"].setdefault(name, {
-                    "trust": 0, "affinity": 0, "respect": 0, "notes": []})
-                for dimension in ("trust", "affinity", "respect"):
-                    raw = ask("  %s [-100..100, current %+d]> " % (dimension, relation[dimension]))
-                    if raw:
-                        try:
-                            relation[dimension] = max(-100, min(100, int(raw)))
-                        except ValueError:
-                            say(dim("  Enter a whole number; value unchanged."))
-                note = ask("  Relationship note (Enter keeps)> ")[:120]
-                if note:
-                    relation.setdefault("notes", []).append(note)
-                    del relation["notes"][:-8]
+                if select_to_talk:
+                    return self.interact_with_person(name, talk_only=True)
+                action = self.interact_with_person(name)
+                if action:
+                    return action
             elif key in ("x", "q", "esc", "\n"):
-                return
+                return None
 
     def recap(self):
         s = self.s
@@ -1905,35 +2619,115 @@ class Game:
         w.feed(s["summary"] or "Nothing to summarise yet. Last scene: " + brief(s["turns"][-1]["scene"], 300))
         w.close()
 
+    def show_history(self, index=None):
+        turns = self.s.get("turns", [])
+        if not turns:
+            say(dim("  No story history yet."))
+            return
+        index = len(turns) - 1 if index is None else max(0, min(index, len(turns) - 1))
+        while True:
+            clear_screen()
+            say(rule("Story history - %d/%d" % (index + 1, len(turns))))
+            turn = turns[index]
+            if turn.get("action") not in ("(the story begins)", "(the end)"):
+                say(dim("  Your action:"))
+                action = Wrap(term_width())
+                action.feed(turn.get("action", ""))
+                action.close()
+                say()
+            scene = Wrap(term_width())
+            scene.feed(turn.get("scene", ""))
+            scene.close()
+            say()
+            say(dim("  Up: older turn  Down: newer turn  Enter/Esc: return"))
+            key = getkey()
+            if key == "up":
+                index = max(0, index - 1)
+            elif key == "down":
+                index = min(len(turns) - 1, index + 1)
+            elif key == "pageup":
+                index = max(0, index - 5)
+            elif key == "pagedown":
+                index = min(len(turns) - 1, index + 5)
+            elif key not in ("\n", "esc", "q"):
+                continue
+            else:
+                return
+
+    def show_world_map(self):
+        locations = clean_map_locations(self.s.get("world_map", []), self.s.get("location", ""))
+        canvas, points = world_map_canvas(locations, self.s.get("location", ""))
+        clear_screen()
+        say(rule("World map"))
+        say("  North")
+        for row in canvas:
+            say("  " + row)
+        say("  South")
+        say(dim("  Roads are laid out by the game; symbols show generated settlements and sites."))
+        say(dim("  @ here  C city  v village  F fort  W workplace  * important spot"))
+        for index, point in enumerate(points):
+            name, kind = point[2], point[3]
+            current = self.s["location"].casefold()
+            icon = "@" if current and (name.casefold() in current or current in name.casefold()) \
+                else MAP_ICONS[kind]
+            say("  %2d. [%s] %s" % (index + 1, icon, name))
+        say(dim("  Press any key to return."))
+        getkey()
+
+    def show_local_map(self):
+        local = self.ensure_local_map()
+        self.app.save_state(self.s)
+        clear_screen()
+        say(rule("Places near %s" % self.s["location"]))
+        say("  Nearby")
+        if local["nearby_places"]:
+            for name in local["nearby_places"]:
+                say("    [ ] %s" % name)
+        else:
+            say("    No nearby places listed.")
+        say()
+        say("  Inside")
+        for name in local["inside_places"]:
+            say("    [%s] %s" % (">" if name.casefold() == "exit" else " ", name))
+        say(dim("  Press any key to return."))
+        getkey()
+
     def show_help(self):
         say()
-        say("  1-%d  take that action        t  type any action (or 'look', 'items', ...)" % len(self.s["choices"]))
-        say("  l  look around (fast)         i  items and status       r  story recap")
-        say("  u  customize places/people    x  settings              b  benchmark models")
+        say("  1-%d  take that action        t  type any action" % len(self.s["choices"]))
+        say("  l  look around (fast)         i  items and player info   r  story recap")
+        say("  p  People (talk, trade, party) c  Talk to someone")
+        say("  m  world map                 Shift+M  local places map")
+        say("  Up/Down  browse story history")
+        say("  PgUp/PgDn  browse story history from the game menu")
+        say("  u  customize places/people    x  settings               b  benchmark models")
         say("  d  story state/debug          a  branch timeline       e  export as Markdown")
-        say("  Talk to anyone or ask a character to trade")
         say("  q  save and return to menu    (every turn is saved automatically)")
 
     def menu(self):
         s = self.s
+        clear_screen()
         say()
         say(rule("%s - turn %d" % (s["preset"], len(s["turns"]))))
         bar = "#" * s["hp"] + "." * (s["max_hp"] - s["hp"])
         say(" %s %s (%s)   %s [%s] %d/%d" % (bold("At:"), s["location"], self.clock_label(),
                               bold("HP"), bar, s["hp"], s["max_hp"]))
         say(" %s %s" % (bold("Carrying:"), ", ".join(s["items"]) or "nothing"))
-        say(" %s %s" % (bold("Goal:"), s["objective"]))
+        say(" %s %s" % (bold("Direction:"), s["objective"]))
         say()
         for i, c in enumerate(s["choices"], 1):
             say("  %d) %s" % (i, c))
-        say(dim("  t:type  l:look  i:items  r:recap  u:edit  d:debug  a:branch"))
-        say(dim("  x:settings  b:bench  e:export  h:help  q:menu"))
+        say(dim("  p:people  c:talk  t:type  m:world map  Shift+M:local map"))
+        say(dim("  l:look  i:items  r:recap  u:edit  Up/Down/PgUp/PgDn:history"))
+        say(dim("  d:debug  a:branch  x:settings  b:bench  e:export  h:help  q:menu"))
 
     def play(self):
         s = self.s
         if not s["turns"]:
             self.app.save_state(s)
             try:
+                self.ensure_local_map()
+                self.app.save_state(s)
                 self.take_turn(None)
             except (OllamaError, Unavailable) as e:
                 say(red("  Could not start: %s" % (e if isinstance(e, OllamaError) else "no narrator model")))
@@ -1950,8 +2744,20 @@ class Game:
             self.menu()
             k = getkey()
             action = None
-            if k.isdigit() and 1 <= int(k) <= len(s["choices"]):
+            if k in ("pageup", "pagedown"):
+                self.show_history(len(s["turns"]) - 1 + (-5 if k == "pageup" else 5))
+            elif k == "m":
+                self.show_world_map()
+            elif k == "shift+m":
+                self.show_local_map()
+            elif k in ("up", "down"):
+                self.show_history(len(s["turns"]) - 1 + (-1 if k == "up" else 1))
+            elif k.isdigit() and 1 <= int(k) <= len(s["choices"]):
                 action = s["choices"][int(k) - 1]
+            elif k == "p":
+                action = self.people_menu()
+            elif k == "c":
+                action = self.people_menu(select_to_talk=True)
             elif k == "t":
                 text = ask("  Your action> ")
                 if not text:
@@ -2152,6 +2958,182 @@ def print_bench(rows, cfg, when=""):
             bold("~%.0fs" % est), " (includes model swaps: only %d fit at once)" % effective_max_loaded(cfg) if swaps else ""))
 
 
+# --------------------------------------------------------------------------- terminal UI
+class TUIOutput:
+    def __init__(self, frontend):
+        self.frontend = frontend
+        self.encoding = "utf-8"
+
+    def write(self, value):
+        self.frontend.write(str(value))
+        return len(value)
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+class CursesFrontend:
+    ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+    def __init__(self):
+        self.screen = None
+        self.lines = [""]
+        self.prompt = ""
+        self.input_text = ""
+        self.status = ""
+        self.colors = False
+
+    def width(self):
+        return max(40, min(100, shutil.get_terminal_size((80, 24)).columns - 1))
+
+    def write(self, value):
+        value = self.ANSI.sub("", value)
+        for char in value:
+            if char == "\r":
+                self.lines[-1] = ""
+            elif char == "\n":
+                self.lines.append("")
+            elif char == "\b":
+                self.lines[-1] = self.lines[-1][:-1]
+            elif char >= " " or char == "\t":
+                self.lines[-1] += char
+        if len(self.lines) > 2000:
+            del self.lines[:len(self.lines) - 2000]
+        self.draw()
+
+    def clear(self):
+        self.lines = [""]
+        self.draw()
+
+    def _wrapped_lines(self, width):
+        output = []
+        for line in self.lines:
+            output.extend(textwrap.wrap(line, width=max(10, width), replace_whitespace=False,
+                                        drop_whitespace=True) or [""])
+        return output
+
+    def draw(self):
+        if self.screen is None:
+            return
+        self.screen.erase()
+        height, width = self.screen.getmaxyx()
+        if height < 6 or width < 30:
+            self.screen.addnstr(0, 0, "Please enlarge the terminal to at least 30x6.", max(1, width - 1))
+            self.screen.refresh()
+            return
+        title_attr = curses.color_pair(1) | curses.A_BOLD if self.colors else curses.A_BOLD
+        divider_attr = curses.color_pair(1) if self.colors else curses.A_NORMAL
+        body_attr = curses.color_pair(2) if self.colors else curses.A_NORMAL
+        footer_attr = curses.color_pair(3) if self.colors else curses.A_NORMAL
+        self.screen.addnstr(0, 0, " STORYFORGE | Interactive terminal", width - 1, title_attr)
+        self.screen.hline(1, 0, curses.ACS_HLINE, width - 1, divider_attr)
+        body_height = height - 4
+        wrapped = self._wrapped_lines(width - 4)
+        start = max(0, len(wrapped) - body_height)
+        visible = wrapped[start:]
+        for row, line in enumerate(visible, 2):
+            self.screen.addnstr(row, 1, line, width - 3, body_attr)
+        self.screen.hline(height - 2, 0, curses.ACS_HLINE, width - 1, divider_attr)
+        footer = self.prompt or ("Working: %s" % self.status if self.status else
+                                 "PgUp/PgDn: story history (game only)  |  Esc: back")
+        if self.prompt:
+            footer += self.input_text
+        self.screen.addnstr(height - 1, 0, footer, width - 1, footer_attr)
+        self.screen.refresh()
+
+    def set_status(self, status):
+        self.status = status
+        self.draw()
+
+    @staticmethod
+    def _key_name(key):
+        if key == curses.KEY_UP:
+            return "up"
+        if key == curses.KEY_DOWN:
+            return "down"
+        if key == curses.KEY_PPAGE:
+            return "pageup"
+        if key == curses.KEY_NPAGE:
+            return "pagedown"
+        if key in (curses.KEY_ENTER, 10, 13, "\n", "\r"):
+            return "\n"
+        if key == 27:
+            return "esc"
+        if key == 3:
+            raise KeyboardInterrupt
+        if isinstance(key, str):
+            return "shift+m" if key == "M" else key.lower()
+        return ""
+
+    def getkey(self):
+        return self._key_name(self.screen.get_wch())
+
+    def ask(self, prompt):
+        self.prompt, self.input_text = prompt, ""
+        self.draw()
+        try:
+            while True:
+                key = self.screen.get_wch()
+                if key in (curses.KEY_ENTER, 10, 13, "\n", "\r"):
+                    return self.input_text.strip()
+                if key == 27:
+                    return ""
+                if key == 3:
+                    raise KeyboardInterrupt
+                if key in (curses.KEY_BACKSPACE, "\b", "\x7f"):
+                    self.input_text = self.input_text[:-1]
+                elif isinstance(key, str) and key.isprintable():
+                    self.input_text += key
+                self.draw()
+        finally:
+            self.prompt, self.input_text = "", ""
+            self.draw()
+
+    def run(self, screen, app):
+        self.screen = screen
+        screen.keypad(True)
+        screen.timeout(-1)
+        curses.noecho()
+        if curses.has_colors():
+            curses.start_color()
+            try:
+                curses.use_default_colors()
+                curses.init_pair(1, curses.COLOR_CYAN, -1)
+                curses.init_pair(2, curses.COLOR_WHITE, -1)
+                curses.init_pair(3, curses.COLOR_YELLOW, -1)
+            except curses.error:
+                curses.init_pair(1, curses.COLOR_CYAN, curses.COLOR_BLACK)
+                curses.init_pair(2, curses.COLOR_WHITE, curses.COLOR_BLACK)
+                curses.init_pair(3, curses.COLOR_YELLOW, curses.COLOR_BLACK)
+            self.colors = True
+            screen.bkgd(" ", curses.color_pair(2))
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
+        self.draw()
+        app.run()
+        self.write("\nYour stories are saved in %s\n" % SAVE_DIR)
+
+
+def run_tui(app):
+    global ACTIVE_TUI
+    if curses is None:
+        raise RuntimeError("The TUI requires a Python build with curses; use --cli instead.")
+    frontend = CursesFrontend()
+    old_stdout = sys.stdout
+    ACTIVE_TUI = frontend
+    sys.stdout = TUIOutput(frontend)
+    try:
+        curses.wrapper(frontend.run, app)
+    finally:
+        sys.stdout = old_stdout
+        ACTIVE_TUI = None
+
+
 # --------------------------------------------------------------------------- application
 class App:
     def __init__(self, cfg):
@@ -2346,10 +3328,154 @@ class App:
             say(red("  Could not export: %s" % e))
 
     # ---- starting stories
+    def create_player_character(self):
+        say()
+        say(rule("Create your character"))
+        say("Select your gender:")
+        say("  1) Male")
+        say("  2) Female")
+        while True:
+            key = getkey()
+            gender = {"1": "male", "2": "female"}.get(key)
+            if gender:
+                break
+            say(dim("  Choose 1 or 2."))
+        while True:
+            raw_age = ask("Select your age (15-40)> ")
+            try:
+                age = int(raw_age)
+            except ValueError:
+                say(dim("  Enter a whole number from 15 to 40."))
+                continue
+            if 15 <= age <= 40:
+                break
+            say(dim("  Your character's age must be from 15 to 40."))
+        description = ask("Write a short description of your character (Enter to confirm, one line)> ")[:240]
+        return {"gender": gender, "age": age, "description": description, "traits": []}
+
+    def build_world(self, scenario, player_character=None):
+        p = dict(scenario)
+        player_character = dict(player_character or {"gender": "", "age": None,
+                                                       "description": "", "traits": []})
+        prompt = (
+            "Build a coherent, original setting for a free-roaming interactive story from this scenario. "
+            "Invent its look, several city names, notable fictional public figures, the player's personal "
+            "backstory and useful player details, memorable character traits, starting items, and world map "
+            "locations, including the starting place and a varied mix of cities, villages, forts, workplaces, "
+            "and important landmarks, plus important local "
+            "characters with brief descriptions, specific visible appearances, distinct outfits, jobs, "
+            "personality traits, and family ties. Make the cast varied and useful for natural "
+            "conversation. Do not use real-world celebrities or existing fictional characters. Keep the "
+            "player's objective open-ended: exploration and conversations should reveal optional leads and "
+            "long adventures, not a mandatory delivery or urgent starting quest. Preserve the scenario's "
+            "genre and avoid contradictions. Respect the player's gender and age without inferring personality "
+            "stereotypes from either; base traits primarily on their own description and give their gender "
+            "only as pronoun guidance. Make traits concrete and useful: they may influence first impressions, "
+            "how people speak or act toward the player, and how the narrator describes the player's thoughts "
+            "and behavior. Do not force NPC reactions when the trait is irrelevant. For map_locations, return "
+            "only structured name and kind entries, where kind is city, village, fort, workplace, or landmark. "
+            "Include the starting location and do not draw any map, road, path, coordinates, or ASCII art; the "
+            "game draws roads itself. For every important character, give concrete, observable appearance and "
+            "clothing details, a plausible occupation, and a few concise personality traits. Keep each field "
+            "separate; do not use generic descriptions like 'looks nice'.\n\nScenario:\n%s\n"
+            "Player-selected character:\n%s\n\nAlso create useful, short loading-screen tips specific "
+            "to this world's exploration, people, and play style. Tips must not spoil secrets or tell the "
+            "player what they must do. As a guide, aim for around 8-14 map locations, three or four important "
+            "local characters, and 5-8 tips; these are suggestions, not hard limits. Use more or fewer when "
+            "the scenario calls for it. Keep details focused, but do not omit or cut off useful world details "
+            "to meet a length target. Complete every required field and finish the JSON response."
+            % (json.dumps({"name": p["name"], "tone": p["tone"], "setting": p["setting"],
+                           "role": p["role"], "starting_location": p["location"],
+                           "open_ended_direction": p["objective"], "starting_items": p["items"]},
+                          ensure_ascii=True), json.dumps(player_character, ensure_ascii=True))
+        )
+        world_loading = self.cfg.get("display_mode", "classic") == "loading"
+        clear_screen()
+        say(rule("Building your world"))
+        say("  Generating cities, landmarks, characters, and your player details...")
+        if world_loading:
+            say("  Tip: %s" % DEFAULT_LOADING_TIPS[0])
+        progress = WorldGenerationProgress()
+        progress.start()
+        try:
+            response = self.ai.chat("narrator", [{"role": "user", "content": prompt}], "world",
+                                    stream=progress.feed, show_status=False,
+                                    fmt=WORLD_SCHEMA,
+                                    options={"temperature": 0.7, "num_predict": -1})
+            details = json.loads(response["content"])
+            if not isinstance(details, dict):
+                raise ValueError("world-building response was not an object")
+        except (OllamaError, Unavailable, ValueError, AttributeError, TypeError) as error:
+            say(dim("  World-building could not complete (%s); using the scenario defaults." % str(error)[:100]))
+            details = {}
+        finally:
+            progress.stop()
+
+        for key, limit in (("name", 40), ("tone", 100), ("setting", 500),
+                           ("role", 100), ("location", 120)):
+            value = sstr(details.get(key), limit)
+            if value:
+                p[key] = value
+        generated_items = details.get("items", [])
+        if isinstance(generated_items, list):
+            items = [sstr(item, 40) for item in generated_items if sstr(item, 40)][:6]
+            if items:
+                p["items"] = items
+        p["objective"] = sstr(scenario.get("objective"), 160) or "Explore at your own pace."
+        state = new_state(p, self.cfg["performance_mode"])
+        player_character["traits"] = [sstr(trait, 100) for trait in details.get("player_traits", [])
+                                      if sstr(trait, 100)][:5] \
+            if isinstance(details.get("player_traits", []), list) else []
+        state["player_character"] = player_character
+        state["world_building"] = {
+            "world_look": sstr(details.get("world_look"), 400),
+            "cities": [sstr(city, 70) for city in details.get("cities", [])
+                       if sstr(city, 70)][:8] if isinstance(details.get("cities"), list) else [],
+            "famous_people": [sstr(person, 100) for person in details.get("famous_people", [])
+                              if sstr(person, 100)][:8]
+                             if isinstance(details.get("famous_people"), list) else [],
+            "player_backstory": sstr(details.get("player_backstory"), 400),
+            "player_info": sstr(details.get("player_info"), 300),
+            "loading_tips": [sstr(tip, 180) for tip in details.get("loading_tips", [])
+                             if sstr(tip, 180)][:8]
+                            if isinstance(details.get("loading_tips"), list) else [],
+        }
+        if not state["world_building"]["loading_tips"]:
+            state["world_building"]["loading_tips"] = list(DEFAULT_LOADING_TIPS)
+        state["world_map"] = clean_map_locations(details.get("map_locations"), p["location"])
+        characters = details.get("important_characters", [])
+        if isinstance(characters, list):
+            for person in characters[:6]:
+                if not isinstance(person, dict):
+                    continue
+                name = sstr(person.get("name"), 30)
+                if not name or name.lower() in [existing.lower() for existing in state["characters"]]:
+                    continue
+                state["characters"].append(name)
+                state["character_profiles"][name] = sstr(person.get("description"), 200)
+                traits = person.get("traits", [])
+                state["character_details"][name] = {
+                    "appearance": sstr(person.get("appearance"), 180),
+                    "clothing": sstr(person.get("clothing"), 180),
+                    "occupation": sstr(person.get("occupation"), 100),
+                    "traits": [sstr(trait, 80) for trait in traits if sstr(trait, 80)][:5]
+                              if isinstance(traits, list) else [],
+                }
+                family = person.get("family", [])
+                state["character_family"][name] = [sstr(member, 80) for member in family
+                                                   if sstr(member, 80)][:5] \
+                    if isinstance(family, list) else []
+                state["relationships"][name] = {
+                    "trust": 0, "affinity": 0, "respect": 0, "loyalty": 0, "notes": []}
+        say(dim("  Traits: %s" % (", ".join(player_character["traits"]) or "not generated")))
+        say(dim("  Built a world with %d local people to meet." % len(state["characters"])))
+        return state
+
     def start(self, preset):
         if not self.ensure_ready():
             return
-        Game(self, new_state(preset, self.cfg["performance_mode"])).play()
+        player = self.create_player_character()
+        Game(self, self.build_world(preset, player)).play()
 
     def custom_world(self):
         if not self.ensure_ready():
@@ -2358,27 +3484,11 @@ class App:
         idea = ask("  Describe your world in a sentence or two> ")
         if not idea:
             return
+        player = self.create_player_character()
         p = dict(name="Custom", tone="adventurous", setting=idea, role="a traveler",
-                 location="the start of your journey", objective="find out what is going on", items=[])
-        msgs = [{"role": "user", "content":
-                 'Turn this idea into a story setup: "%s". Fill in: name (1-2 words), tone (a few words), '
-                 "setting (one or two sentences), role (who the player is, e.g. \"a lighthouse keeper\"), "
-                 "location (where the story starts), objective (the player's first goal), items (2-3 "
-                 "starting items)." % idea}]
-        try:
-            res = self.ai.chat("narrator", msgs, "world", fmt=SETUP_SCHEMA,
-                               options={"temperature": 0.7, "num_predict": 220})
-            d = json.loads(res["content"])
-            for k in ("name", "tone", "setting", "role", "location", "objective"):
-                v = sstr(d.get(k), 160)
-                if v:
-                    p[k] = v
-            items = [sstr(i, 30) for i in d.get("items", []) if sstr(i, 30)][:4]
-            p["items"] = items or p["items"]
-        except (OllamaError, Unavailable, ValueError, AttributeError, TypeError):
-            say(dim("  (could not expand the idea - using it as it is)"))
-        say(dim("  World: %s | You are %s | Goal: %s" % (p["name"], p["role"], p["objective"])))
-        Game(self, new_state(p, self.cfg["performance_mode"])).play()
+                 location="a public place at the start of your journey",
+                 objective="Explore at your own pace and follow any lead that interests you.", items=[])
+        Game(self, self.build_world(p, player)).play()
 
     def load_menu(self):
         saves = self.list_saves()
@@ -2386,6 +3496,7 @@ class App:
             say(dim("  No saved stories yet."))
             return
         while True:
+            clear_screen()
             say()
             say(rule("Continue a story"))
             shown = saves[:9]
@@ -2422,6 +3533,7 @@ class App:
     def models_menu(self):
         c = self.cfg
         while True:
+            clear_screen()
             say()
             say(rule("Models per role"))
             for i, (role, (_d, label, desc)) in enumerate(ROLES.items(), 1):
@@ -2470,6 +3582,7 @@ class App:
     def settings_menu(self):
         c = self.cfg
         while True:
+            clear_screen()
             say()
             say(rule("Settings"))
             if self.ai.online:
@@ -2489,6 +3602,10 @@ class App:
                 ("3", "Keep models loaded for", c["keep_alive"]),
                 ("4", "Scene length", "%s (~%d words)" % (c["length"], LENGTHS[c["length"]])),
                 ("5", "Creativity (temperature)", "%.1f" % c["temperature"]),
+                ("n", "Narration mode", "%d) %s" % (
+                    c.get("narration_mode", 2), NARRATION_MODES.get(c.get("narration_mode", 2),
+                                                                     NARRATION_MODES[2])[0])),
+                ("m", "Story display", c.get("display_mode", "classic").title()),
                 ("6", "Choices per turn", str(c["choices"])),
                 ("7", "Memory recall (embeddings)", "top %d" % c["recall"] if c["recall"] else "off"),
                 ("8", "State tracking (tool calls)", onoff(c["tracking"])),
@@ -2502,6 +3619,8 @@ class App:
             for key, label, val in rows:
                 say(" %s) %-30s %s" % (key, label, val))
             say(dim(" Fewer models in memory = less RAM but slower turns; use b to measure."))
+            say(dim(" Narration: n cycles 1) player's senses  2) balanced  3) full cinematic"))
+            say(dim(" Display: m cycles Classic streaming and Loading screen."))
             k = getkey()
             if k == "p":
                 self.performance_menu()
@@ -2515,6 +3634,10 @@ class App:
                 c["length"] = cycle(list(LENGTHS), c["length"])
             elif k == "5":
                 c["temperature"] = cycle([0.4, 0.6, 0.8, 1.0], c["temperature"])
+            elif k == "n":
+                c["narration_mode"] = cycle(list(NARRATION_MODES), c.get("narration_mode", 2))
+            elif k == "m":
+                c["display_mode"] = cycle(DISPLAY_MODES, c.get("display_mode", "classic"))
             elif k == "6":
                 c["choices"] = cycle([2, 3, 4], c["choices"])
             elif k == "7":
@@ -2603,6 +3726,7 @@ class App:
     def run(self):
         self.connect(quiet=True)
         while True:
+            clear_screen()
             say()
             say(rule("STORYFORGE"))
             say(self.status_line())
@@ -2631,6 +3755,7 @@ class App:
 def main():
     ap = argparse.ArgumentParser(description="Interactive stories with tiny local Ollama models.")
     ap.add_argument("--host", help="Ollama host (default: $OLLAMA_HOST or 127.0.0.1:11434)")
+    ap.add_argument("--cli", action="store_true", help="use the classic line-oriented CLI instead of the TUI")
     ap.add_argument("--benchmark", action="store_true", help="benchmark the models and exit")
     ap.add_argument("--full", action="store_true", help="with --benchmark: 3 passes instead of 1")
     ap.add_argument("--version", action="version", version="StoryForge " + VERSION)
@@ -2644,11 +3769,17 @@ def main():
             if app.connect():
                 app.run_benchmark(3 if args.full else 1)
             return
-        app.run()
+        if args.cli:
+            app.run()
+        else:
+            if not sys.stdin.isatty() or not sys.stdout.isatty():
+                ap.error("the TUI needs an interactive terminal; use --cli for classic terminal mode")
+            run_tui(app)
     except (KeyboardInterrupt, EOFError):
         pass
-    say()
-    say(dim("  Your stories are saved in %s" % SAVE_DIR))
+    if args.cli:
+        say()
+        say(dim("  Your stories are saved in %s" % SAVE_DIR))
 
 
 if __name__ == "__main__":
