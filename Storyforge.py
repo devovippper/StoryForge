@@ -2320,9 +2320,7 @@ class Game:
             return "talk"
         if '"' in text or t.startswith(("say ", "ask ", "tell ")):
             return "talk"
-        if len(t.split()) < 2 or not self.ai.has("router"):
-            return "action"
-        return self.guard(self.classify, text, role="router") or "action"
+        return "action"
 
     def classify(self, text):
         res = self.ai.chat("router", [{"role": "user", "content": ROUTE_PROMPT + text}], "route",
